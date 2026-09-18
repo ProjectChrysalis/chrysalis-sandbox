@@ -21,7 +21,16 @@ const argsOf = (ctx) => {
   return a[0] === "./this.program" ? a.slice(1) : a;
 };
 const cwdOf = (ctx) => (typeof ctx.cwd === "string" && ctx.cwd.startsWith("/") ? ctx.cwd : "/workspace");
-const norm = (p) => p.replace(/\/{2,}/g, "/");
+/** POSIX-ish normalization: collapses //, . and .. so "." means the cwd. */
+const norm = (p) => {
+  const segments = [];
+  for (const part of String(p).split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") segments.pop();
+    else segments.push(part);
+  }
+  return `/${segments.join("/")}`;
+};
 const resolve = (ctx, p) => {
   const s = String(p);
   return norm(s.startsWith("/") ? s : `${cwdOf(ctx).replace(/\/$/, "")}/${s}`);
@@ -234,7 +243,7 @@ export function makeExtraTools({ store, nested, net }) {
     const targets = [];
     for (const p of paths) {
       const abs = resolve(ctx, p);
-      if (isDir(abs)) targets.push(...walk(abs));
+      if (isDir(abs)) targets.push(...walk(abs).filter((path) => !path.includes("/.git/")));
       else targets.push(abs);
     }
     let matched = false;
@@ -500,6 +509,8 @@ export function makeExtraTools({ store, nested, net }) {
           node = { k: "pipe", left: node, right: parsePath("[") };
         } else if (peek(".") && !peek("..")) {
           node = { k: "pipe", left: node, right: parsePath(".") };
+        } else if (tryEat("?")) {
+          node = { k: "try", value: node };
         } else return node;
       }
     };
@@ -679,6 +690,12 @@ export function makeExtraTools({ store, nested, net }) {
         }
         return results;
       }
+      case "try":
+        try {
+          return evaluateJq(node.value, inputs);
+        } catch {
+          return [];
+        }
       case "alt": {
         const left = evaluateJq(node.left, inputs).filter(jqTruthy);
         return left.length ? left : evaluateJq(node.right, inputs);
@@ -850,9 +867,9 @@ export function makeExtraTools({ store, nested, net }) {
     }
     return 0;
   };
-  const gunzip = (ctx) => {
+  const gunzip = (ctx, forceStdout = false) => {
     const argv = argsOf(ctx);
-    const toStdout = argv.includes("-c");
+    const toStdout = forceStdout || argv.includes("-c");
     const keep = argv.includes("-k");
     const files = argv.filter((a) => !a.startsWith("-"));
     if (!files.length) {
@@ -886,7 +903,7 @@ export function makeExtraTools({ store, nested, net }) {
     }
     return 0;
   };
-  const zcat = (ctx) => gunzip(ctx);
+  const zcat = (ctx) => gunzip(ctx, true);
 
   const tar = (ctx) => {
     const argv = argsOf(ctx);
@@ -1223,12 +1240,23 @@ export function makeExtraTools({ store, nested, net }) {
     const pattern = rest.length > 1 || (rest.length === 1 && !isDir(resolve(ctx, rest[0]))) ? rest.shift() : null;
     const root = resolve(ctx, rest[0] ?? ".");
     const re = pattern ? new RegExp(pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i") : null;
+    const files = walk(root);
+    // Directories exist only as prefixes of file paths in the store.
+    const dirs = new Set();
+    for (const path of files) {
+      let dir = path.slice(0, path.lastIndexOf("/"));
+      while (dir.length > root.length && dir.startsWith(root)) {
+        dirs.add(dir);
+        dir = dir.slice(0, dir.lastIndexOf("/"));
+      }
+    }
+    const candidates = type === "d" ? [...dirs].sort() : files;
     let found = false;
-    for (const path of walk(root)) {
+    for (const path of candidates) {
       const name = path.split("/").pop() ?? "";
       if (!hidden && name.startsWith(".")) continue;
       if (type === "f" && isDir(path)) continue;
-      if (type === "d") continue;
+      if (type === "d" && !dirs.has(path)) continue;
       if (ext && !name.endsWith(`.${ext}`)) continue;
       if (re && !re.test(name)) continue;
       found = true;

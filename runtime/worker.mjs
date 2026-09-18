@@ -696,6 +696,18 @@ async function builtins() {
     }
     return null;
   };
+  const gitMeta = (ctx) => {
+    const first = userArgsOf(ctx)[0];
+    if (first === "--version" || first === "-v") {
+      ctx.stdout("git version 2.44.0 (libgit2, chrysalis sandbox)\n");
+      return 0;
+    }
+    if (first === "--help" || first === "-h") {
+      ctx.stdout("usage: git <command> [<args>]\n\ncommands: add, branch, clone, commit, diff, fetch, init, log, push, remote, rev-parse, show, status\n");
+      return 0;
+    }
+    return null;
+  };
   const gitRemotes = (ctx) => {
     const repo = gitRepo(ctx);
     if (!repo) {
@@ -951,6 +963,8 @@ async function builtins() {
     nodejs: runNode,
     curl: runCurl,
     git(ctx) {
+      const version = gitMeta(ctx);
+      if (version !== null) return version;
       const first = userArgsOf(ctx)[0];
       if (first === "branch") return runGitBranch(ctx);
       if (first === "remote") return gitRemotes(ctx);
