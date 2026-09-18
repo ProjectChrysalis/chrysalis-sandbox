@@ -270,102 +270,487 @@ export function makeExtraTools({ store, nested, net }) {
   };
 
   // ---------------------------------------------------------------------- jq
+  // A small jq over value streams: paths, arithmetic/comparison/logic, pipes,
+  // array and object construction, and the functions agents actually use.
+  // Anything outside the grammar says "unsupported filter" instead of guessing.
   const jq = (ctx) => {
     const argv = argsOf(ctx);
     let raw = false;
     let compact = false;
+    let exitStatus = false;
     const rest = [];
     for (const a of argv) {
       if (a === "-r" || a === "--raw-output") raw = true;
       else if (a === "-c" || a === "--compact-output") compact = true;
-      else if (a === "-e" || a === "--exit-status") continue;
-      else if (a === "." && !rest.length) rest.push(a);
-      else if (!a.startsWith("-") || a === ".") rest.push(a);
+      else if (a === "-e" || a === "--exit-status") exitStatus = true;
+      else if (a === "-j" || a === "--join-output" || a === "-n" || a === "--null-input") continue;
+      else rest.push(a);
     }
     const filter = rest[0] ?? ".";
     const file = rest[1];
-    let input;
-    try {
-      input = JSON.parse(decoder.decode(file ? read(ctx, file) : stdinBytes(ctx)));
-    } catch {
-      return fail(ctx, "jq: invalid JSON input");
+    let inputs;
+    if (argv.includes("-n") || argv.includes("--null-input")) inputs = [null];
+    else {
+      try {
+        inputs = [JSON.parse(decoder.decode(file ? read(ctx, file) : stdinBytes(ctx)))];
+      } catch {
+        return fail(ctx, "jq: invalid JSON input");
+      }
     }
-    let value;
+    let values;
     try {
-      value = runFilter(input, filter);
+      values = evaluateJq(parseJq(filter), inputs);
     } catch (e) {
       return fail(ctx, `jq: ${(e && e.message) || e}`);
     }
-    if (value === undefined) {
-      ctx.stdout("null\n");
-      return 1;
+    for (const value of values) {
+      if (value === undefined) ctx.stdout("null\n");
+      else if (raw && typeof value === "string") ctx.stdout(`${value}\n`);
+      else ctx.stdout(`${JSON.stringify(value, null, compact ? 0 : 2)}\n`);
     }
-    if (raw && typeof value === "string") ctx.stdout(`${value}\n`);
-    else ctx.stdout(`${JSON.stringify(value, null, compact ? 0 : 2)}\n`);
+    if (exitStatus) return values.length && values.some((v) => v !== false && v !== null) ? 0 : 1;
     return 0;
   };
-  const runFilter = (input, filter) => {
-    const stages = splitTop(filter, "|");
-    let value = input;
-    for (const rawStage of stages) {
-      const stage = rawStage.trim();
-      if (stage === ".") continue;
-      if (stage === "length") {
-        value = value == null ? 0 : typeof value === "object" ? Object.keys(value).length : value.length;
-        continue;
+
+  const jqTruthy = (v) => v !== false && v !== null && v !== undefined;
+  const jqLength = (v) => {
+    if (v == null) return 0;
+    if (typeof v === "number") return Math.abs(v);
+    if (typeof v === "string") return [...v].length;
+    return Object.keys(v).length;
+  };
+  const jqKeys = (v) => {
+    if (Array.isArray(v)) return v.map((_, i) => i);
+    if (v && typeof v === "object") return Object.keys(v).sort();
+    return [];
+  };
+  const jqType = (v) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
+  const jqEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const jqAdd = (a, b) => {
+    if (a == null) return b;
+    if (b == null) return a;
+    if (typeof a === "number" && typeof b === "number") return a + b;
+    if (typeof a === "string" && typeof b === "string") return a + b;
+    if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
+    if (typeof a === "object" && typeof b === "object") return { ...a, ...b };
+    if (typeof a === "string" || typeof b === "string") return String(a) + String(b);
+    return Number(a) + Number(b);
+  };
+  const jqSum = (v) => {
+    if (!Array.isArray(v)) return v ?? null;
+    if (!v.length) return null;
+    return v.reduce((acc, item) => (acc === null ? item : jqAdd(acc, item)), null);
+  };
+
+
+  const applyJqOp = (op, l, r) => {
+    if (op === "or") return jqTruthy(l) || jqTruthy(r);
+    if (op === "and") return jqTruthy(l) && jqTruthy(r);
+    switch (op) {
+      case "+": return jqAdd(l, r);
+      case "-": return Number(l) - Number(r);
+      case "*": return Number(l) * Number(r);
+      case "/": return Number(l) / Number(r);
+      case "%": return Number(l) % Number(r);
+      case "==": return jqEqual(l, r);
+      case "!=": return !jqEqual(l, r);
+      case "<": return l < r;
+      case "<=": return l <= r;
+      case ">": return l > r;
+      case ">=": return l >= r;
+    }
+    throw new Error(`unsupported operator: ${op}`);
+  };
+
+  const parseJq = (text) => {
+    let pos = 0;
+    const ws = () => {
+      while (pos < text.length && /\s/.test(text[pos])) pos++;
+    };
+    const peek = (s) => {
+      ws();
+      return text.startsWith(s, pos);
+    };
+    const eat = (s) => {
+      if (!peek(s)) throw new Error(`unsupported filter: ${text}`);
+      pos += s.length;
+    };
+    const tryEat = (s) => {
+      if (peek(s)) {
+        pos += s.length;
+        return true;
       }
-      if (stage === "keys") {
-        value = Object.keys(value ?? {}).sort();
-        continue;
+      return false;
+    };
+    const keyword = (word) => {
+      ws();
+      const m = new RegExp(`^${word}\\b`).test(text.slice(pos));
+      if (m) pos += word.length;
+      return m;
+    };
+    const ident = () => {
+      ws();
+      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(pos));
+      if (!m) throw new Error(`unsupported filter: ${text}`);
+      pos += m[0].length;
+      return m[0];
+    };
+    const jqString = () => {
+      ws();
+      if (text[pos] !== '"') throw new Error(`unsupported filter: ${text}`);
+      let out = "";
+      pos++;
+      while (pos < text.length && text[pos] !== '"') {
+        if (text[pos] === "\\") {
+          const c = text[pos + 1];
+          out += c === "n" ? "\n" : c === "t" ? "\t" : c === "r" ? "\r" : c;
+          pos += 2;
+        } else {
+          out += text[pos++];
+        }
       }
-      if (stage === "type") {
-        value = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
-        continue;
+      pos++;
+      return out;
+    };
+    const jqNumber = () => {
+      ws();
+      const m = /^\d+(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(pos));
+      if (!m) throw new Error(`unsupported filter: ${text}`);
+      pos += m[0].length;
+      return Number(m[0]);
+    };
+
+    const parsePipe = () => {
+      let left = parseComma();
+      while (tryEat("|")) left = { k: "pipe", left, right: parseComma() };
+      return left;
+    };
+    const parseComma = () => {
+      let left = parseAlt();
+      while (tryEat(",")) left = { k: "comma", left, right: parseAlt() };
+      return left;
+    };
+    const parseAlt = () => {
+      let left = parseOr();
+      while (tryEat("//")) left = { k: "alt", left, right: parseOr() };
+      return left;
+    };
+    const parseOr = () => {
+      let left = parseAnd();
+      while (keyword("or")) left = { k: "bin", op: "or", left, right: parseAnd() };
+      return left;
+    };
+    const parseAnd = () => {
+      let left = parseCompare();
+      while (keyword("and")) left = { k: "bin", op: "and", left, right: parseCompare() };
+      return left;
+    };
+    const parseCompare = () => {
+      const left = parseAdditive();
+      for (const op of ["==", "!=", "<=", ">=", "<", ">"]) {
+        if (peek(op)) {
+          pos += op.length;
+          return { k: "bin", op, left, right: parseAdditive() };
+        }
       }
-      if (stage === "first") {
-        value = Array.isArray(value) ? value[0] : undefined;
-        continue;
+      return left;
+    };
+    const parseAdditive = () => {
+      let left = parseMultiplicative();
+      for (;;) {
+        if (peek("+")) {
+          pos++;
+          left = { k: "bin", op: "+", left, right: parseMultiplicative() };
+        } else if (peek("-")) {
+          pos++;
+          left = { k: "bin", op: "-", left, right: parseMultiplicative() };
+        } else return left;
       }
-      if (stage === "last") {
-        value = Array.isArray(value) ? value[value.length - 1] : undefined;
-        continue;
+    };
+    const parseMultiplicative = () => {
+      let left = parseUnary();
+      for (;;) {
+        if (peek("*")) {
+          pos++;
+          left = { k: "bin", op: "*", left, right: parseUnary() };
+        } else if (peek("/") && !peek("//")) {
+          pos++;
+          left = { k: "bin", op: "/", left, right: parseUnary() };
+        } else if (peek("%")) {
+          pos++;
+          left = { k: "bin", op: "%", left, right: parseUnary() };
+        } else return left;
       }
-      if (!stage.startsWith(".")) throw new Error(`unsupported filter: ${stage}`);
-      const bare = stage.replace(/\.(?=\[)/g, "").replace(/\s+/g, "");
-      const tokens = stage.match(/\[\s*(\d*)\s*\]|\."([^"]+)"|\.[A-Za-z_][\w-]*/g) ?? [];
-      if (tokens.join("") !== bare) throw new Error(`unsupported filter: ${stage}`);
-      for (const token of tokens) {
-        const bracket = token.match(/^\[\s*(\d*)\s*\]$/);
-        if (bracket) {
-          if (value == null) {
-            value = undefined;
-            break;
+    };
+    const parseUnary = () => {
+      ws();
+      if (peek("-")) {
+        pos++;
+        return { k: "neg", value: parseUnary() };
+      }
+      if (keyword("not")) return { k: "not", value: parseUnary() };
+      return parsePostfix();
+    };
+    const parsePostfix = () => {
+      let node = parsePrimary();
+      for (;;) {
+        ws();
+        if (peek(".[") || (peek("[") && node.k !== "identity")) {
+          // index or iterate applied to the current node
+          node = { k: "pipe", left: node, right: parsePath("[") };
+        } else if (peek(".") && !peek("..")) {
+          node = { k: "pipe", left: node, right: parsePath(".") };
+        } else return node;
+      }
+    };
+    const parsePath = (start) => {
+      const steps = [];
+      if (start === ".") {
+        pos++;
+        steps.push({ k: "key", value: parseSegment() });
+      }
+      for (;;) {
+        ws();
+        if (peek("[")) {
+          pos++;
+          ws();
+          if (peek("]")) {
+            pos++;
+            steps.push({ k: "iterate" });
+          } else if (text[pos] === '"') {
+            steps.push({ k: "index", value: jqString() });
+            eat("]");
+          } else {
+            const m = /^-?\d+/.exec(text.slice(pos));
+            if (!m) throw new Error(`unsupported filter: ${text}`);
+            pos += m[0].length;
+            steps.push({ k: "index", value: Number(m[0]) });
+            eat("]");
           }
-          if (bracket[1] === "") value = Array.isArray(value) ? value : Object.values(value);
-          else value = value[Number(bracket[1])];
           continue;
         }
-        const key = token.startsWith('."') ? token.slice(2, -1) : token.slice(1);
-        value = value == null ? undefined : value[key];
+        if (peek(".")) {
+          pos++;
+          steps.push({ k: "key", value: parseSegment() });
+          continue;
+        }
+        break;
       }
-    }
-    return value;
+      return steps.length ? { k: "path", steps } : { k: "identity" };
+    };
+    const parseSegment = () => {
+      ws();
+      if (text[pos] === '"') return jqString();
+      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(pos));
+      if (!m) throw new Error(`unsupported filter: ${text}`);
+      pos += m[0].length;
+      return m[0];
+    };
+    const ZERO_ARG = new Set(["length", "keys", "type", "first", "last", "add", "tostring", "tonumber", "tojson", "fromjson", "ascii_downcase", "ascii_upcase", "empty", "now", "floor", "ceil", "round"]);
+    const ARG_FUNCS = new Set(["map", "select", "has", "split", "join", "any", "all", "contains", "startswith", "endswith", "ltrimstr", "rtrimstr"]);
+    const parsePrimary = () => {
+      ws();
+      if (text[pos] === "(") {
+        pos++;
+        const inner = parsePipe();
+        eat(")");
+        return inner;
+      }
+      if (text[pos] === "[") {
+        pos++;
+        ws();
+        if (text[pos] === "]") {
+          pos++;
+          return { k: "array", value: { k: "identity" } };
+        }
+        const inner = parsePipe();
+        eat("]");
+        return { k: "array", value: inner };
+      }
+      if (text[pos] === "{") {
+        pos++;
+        const entries = [];
+        ws();
+        if (text[pos] !== "}") {
+          for (;;) {
+            ws();
+            let key;
+            if (text[pos] === '"') key = jqString();
+            else key = ident();
+            ws();
+            if (tryEat(":")) entries.push([key, parseAlt()]);
+            else entries.push([key, { k: "path", steps: [{ k: "key", value: key }] }]);
+            if (tryEat(",")) continue;
+            break;
+          }
+        }
+        eat("}");
+        return { k: "object", entries };
+      }
+      if (text[pos] === ".") {
+        if (/^\.\s*[A-Za-z_"]/.test(text.slice(pos)) || /^\.\s*\[/.test(text.slice(pos))) return parsePath(".");
+        pos++;
+        return { k: "identity" };
+      }
+      if (text[pos] === "@") {
+        pos++;
+        const name = ident();
+        return { k: "format", name };
+      }
+      if (text[pos] === '"') return { k: "literal", value: jqString() };
+      if (/\d/.test(text[pos] ?? "")) return { k: "literal", value: jqNumber() };
+      if (keyword("true")) return { k: "literal", value: true };
+      if (keyword("false")) return { k: "literal", value: false };
+      if (keyword("null")) return { k: "literal", value: null };
+      if (/^[A-Za-z_]/.test(text[pos] ?? "")) {
+        const name = ident();
+        if (tryEat("(")) {
+          if (!ARG_FUNCS.has(name)) throw new Error(`unsupported function: ${name}`);
+          const args = [];
+          ws();
+          if (text[pos] !== ")") {
+            for (;;) {
+              args.push(parseAlt());
+              if (tryEat(",")) continue;
+              break;
+            }
+          }
+          eat(")");
+          return { k: "call", name, args };
+        }
+        if (!ZERO_ARG.has(name)) throw new Error(`unsupported filter: ${text}`);
+        return { k: "call", name, args: [] };
+      }
+      throw new Error(`unsupported filter: ${text}`);
+    };
+
+    const program = parsePipe();
+    ws();
+    if (pos < text.length) throw new Error(`unsupported filter: ${text}`);
+    return program;
   };
-  const splitTop = (text, sep) => {
-    const out = [];
-    let depth = 0;
-    let start = 0;
-    for (let i = 0; i < text.length; i++) {
-      const c = text[i];
-      if (c === "(" || c === "[" || c === "{") depth++;
-      else if (c === ")" || c === "]" || c === "}") depth--;
-      else if (c === sep && depth === 0) {
-        out.push(text.slice(start, i));
-        start = i + 1;
+
+  const navigateJq = (input, steps) => {
+    let stream = [input];
+    for (const step of steps) {
+      const next = [];
+      for (const value of stream) {
+        if (step.k === "iterate") {
+          if (Array.isArray(value)) next.push(...value);
+          else if (value && typeof value === "object") next.push(...Object.values(value));
+        } else if (step.k === "index") {
+          if (Array.isArray(value)) {
+            const index = Number(step.value);
+            if (index >= 0 && index < value.length) next.push(value[index]);
+          } else if (value && typeof value === "object") {
+            if (step.value in value) next.push(value[step.value]);
+          } else if (value == null) next.push(null);
+        } else if (value == null) next.push(null);
+        else next.push(value[step.value] ?? null);
       }
+      stream = next;
     }
-    out.push(text.slice(start));
-    return out;
+    return stream;
+  };
+
+  const evaluateJq = (node, inputs) => {
+    switch (node.k) {
+      case "identity":
+        return inputs;
+      case "literal":
+        return inputs.map(() => node.value);
+      case "path": {
+        const out = [];
+        for (const input of inputs) out.push(...navigateJq(input, node.steps));
+        return out;
+      }
+      case "comma":
+        return [...evaluateJq(node.left, inputs), ...evaluateJq(node.right, inputs)];
+      case "pipe":
+        return evaluateJq(node.right, evaluateJq(node.left, inputs));
+      case "bin": {
+        const results = [];
+        for (const input of inputs) {
+          const left = evaluateJq(node.left, [input]);
+          const right = evaluateJq(node.right, [input]);
+          for (const l of left) {
+            for (const r of right) results.push(applyJqOp(node.op, l, r));
+          }
+        }
+        return results;
+      }
+      case "alt": {
+        const left = evaluateJq(node.left, inputs).filter(jqTruthy);
+        return left.length ? left : evaluateJq(node.right, inputs);
+      }
+      case "neg":
+        return evaluateJq(node.value, inputs).map((v) => -Number(v));
+      case "not":
+        return evaluateJq(node.value, inputs).map((v) => !jqTruthy(v));
+      case "array":
+        return [evaluateJq(node.value, inputs)];
+      case "object": {
+        const out = {};
+        for (const [key, value] of node.entries) out[key] = evaluateJq(value, inputs)[0] ?? null;
+        return [out];
+      }
+      case "format": {
+        const value = inputs[0];
+        if (node.name === "base64") return [btoa(typeof value === "string" ? value : JSON.stringify(value))];
+        if (node.name === "base64d") return [atob(String(value))];
+        if (node.name === "tsv") return [Array.isArray(value) ? value.map((v) => String(v ?? "")).join("\t") : String(value)];
+        if (node.name === "csv") return [Array.isArray(value) ? value.map((v) => (typeof v === "string" && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : String(v ?? ""))).join(",") : String(value)];
+        if (node.name === "json") return [JSON.stringify(value)];
+        throw new Error(`unsupported filter: @${node.name}`);
+      }
+      case "call": {
+        const first = inputs[0];
+        const arg = (i) => (node.args[i] ? evaluateJq(node.args[i], inputs) : []);
+        switch (node.name) {
+          case "length": return [jqLength(first)];
+          case "keys": return [jqKeys(first)];
+          case "type": return [jqType(first)];
+          case "first": return node.args.length ? evaluateJq(node.args[0], inputs).slice(0, 1) : [Array.isArray(first) ? first[0] : first];
+          case "last": return node.args.length ? evaluateJq(node.args[0], inputs).slice(-1) : [Array.isArray(first) ? first[first.length - 1] : first];
+          case "add": return [jqSum(first)];
+          case "tostring": return inputs.map((v) => (typeof v === "string" ? v : JSON.stringify(v)));
+          case "tonumber": return inputs.map((v) => Number(v));
+          case "tojson": return inputs.map((v) => JSON.stringify(v));
+          case "fromjson": return inputs.map((v) => JSON.parse(String(v)));
+          case "ascii_downcase": return inputs.map((v) => String(v).toLowerCase());
+          case "ascii_upcase": return inputs.map((v) => String(v).toUpperCase());
+          case "split": return [String(first).split(String(arg(0)[0] ?? ""))];
+          case "join": return [Array.isArray(first) ? first.map((v) => String(v ?? "")).join(String(arg(0)[0] ?? "")) : String(first)];
+          case "map": return [evaluateJq(node.args[0], Array.isArray(first) ? first : [first])];
+          case "select": {
+            const kept = [];
+            for (const input of inputs) if (evaluateJq(node.args[0], [input]).some(jqTruthy)) kept.push(input);
+            return kept;
+          }
+          case "has": {
+            const key = arg(0)[0];
+            if (Array.isArray(first)) return [typeof key === "number" && key >= 0 && key < first.length];
+            if (first && typeof first === "object") return [key in first];
+            return [false];
+          }
+          case "any": return [inputs.some((v) => (Array.isArray(v) ? v.some(jqTruthy) : jqTruthy(v)))];
+          case "all": return [inputs.every((v) => (Array.isArray(v) ? v.every(jqTruthy) : jqTruthy(v)))];
+          case "contains": return [JSON.stringify(first).includes(String(arg(0)[0]))];
+          case "startswith": return [String(first).startsWith(String(arg(0)[0]))];
+          case "endswith": return [String(first).endsWith(String(arg(0)[0]))];
+          case "ltrimstr": return [typeof first === "string" && first.startsWith(String(arg(0)[0])) ? first.slice(String(arg(0)[0]).length) : first];
+          case "rtrimstr": return [typeof first === "string" && first.endsWith(String(arg(0)[0])) ? first.slice(0, -String(arg(0)[0]).length) : first];
+          case "floor": return inputs.map((v) => Math.floor(Number(v)));
+          case "ceil": return inputs.map((v) => Math.ceil(Number(v)));
+          case "round": return inputs.map((v) => Math.round(Number(v)));
+          case "empty": return [];
+          case "now": return [Date.now() / 1000];
+          default: throw new Error(`unsupported function: ${node.name}`);
+        }
+      }
+      default:
+        throw new Error("unsupported filter");
+    }
   };
 
   // ------------------------------------------------------------ diff and cmp
