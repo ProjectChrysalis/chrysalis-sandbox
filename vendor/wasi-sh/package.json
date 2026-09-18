@@ -1,0 +1,65 @@
+{
+  "name": "wasi-sh",
+  "version": "0.11.0",
+  "description": "Run shell scripts in the browser — busybox ash + coreutils compiled to wasm32-wasi, fork-free",
+  "license": "ISC",
+  "author": "Alexandre Gomes Gaigalas <alganet@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alganet/wasi-sh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alganet/wasi-sh/issues"
+  },
+  "homepage": "https://github.com/alganet/wasi-sh#readme",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./run": "./src/run.mjs",
+    "./spawn": "./src/spawn.mjs",
+    "./shim": "./src/shim.mjs",
+    "./worker": "./src/worker.mjs",
+    "./ring": "./src/ring.mjs",
+    "./fs": "./src/fs.mjs",
+    "./fs/conformance": "./src/fs-conformance.mjs",
+    "./files": "./src/files.mjs",
+    "./node": "./src/node.mjs",
+    "./busybox.wasm": "./dist/busybox.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist",
+    "build",
+    "!build/work",
+    "examples",
+    "scripts"
+  ],
+  "sideEffects": [
+    "./src/worker.mjs"
+  ],
+  "scripts": {
+    "pretest": "[ -s dist/busybox.wasm ] || { echo 'dist/busybox.wasm is missing — run: npm run build:wasm' >&2; exit 1; }",
+    "test": "node --test",
+    "serve": "node scripts/serve.mjs",
+    "build:wasm": "build/build.sh",
+    "prepack": "[ -s dist/busybox.wasm ] || { echo 'refusing to pack without dist/busybox.wasm — run: npm run build:wasm' >&2; exit 1; }"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "wasm",
+    "wasi",
+    "shell",
+    "sh",
+    "ash",
+    "busybox",
+    "browser",
+    "terminal",
+    "webassembly"
+  ],
+  "devDependencies": {
+    "@zenfs/core": "2.6.3"
+  }
+}

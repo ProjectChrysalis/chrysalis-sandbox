@@ -1,0 +1,19 @@
+{
+  "name": "chrysalis-sandbox",
+  "version": "0.3.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun serve.ts",
+    "pack": "bun scripts/pack.ts",
+    "release": "bun run pack"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@jitl/quickjs-ng-wasmfile-release-sync": "^0.32.0",
+    "esbuild": "0.28.2",
+    "fflate": "^0.8.3",
+    "quickjs-emscripten-core": "^0.32.0"
+  },
+  "license": "GPL-2.0-only"
+}
