@@ -82,7 +82,8 @@ export async function exec(command, options = {}) {
   // which breaks scripts. Define a POSIX-ish echo up front so every command
   // in this session sees the expected behavior. `sh`/`ash` forward to the
   // nested-shell builtin: the applet replaces the whole session when it runs a
-  // script, which silently swallows the rest of the command line.
+  // script, which silently swallows the rest of the command line. `head` and
+  // `tail` fill in -c, which this busybox build never learned.
   const ECHO_SHIM = [
     "echo() {",
     "  nl=1; esc=0",
@@ -101,6 +102,26 @@ export async function exec(command, options = {}) {
     "}",
     "sh() { bash \"$@\"; }",
     "ash() { bash \"$@\"; }",
+    "head() {",
+    "  if [ \"$1\" = \"-c\" ]; then",
+    "    shift; n=$1; shift",
+    "    if [ $# -gt 0 ]; then dd bs=1 count=$n < \"$1\" 2>/dev/null; else dd bs=1 count=$n 2>/dev/null; fi",
+    "    return 0",
+    "  fi",
+    "  command head \"$@\"",
+    "}",
+    "tail() {",
+    "  if [ \"$1\" = \"-c\" ]; then",
+    "    shift; n=$1; shift",
+    "    if [ $# -gt 0 ]; then f=$1; else f=$(mktemp); cat > \"$f\"; fi",
+    "    total=$(wc -c < \"$f\" 2>/dev/null || echo 0)",
+    "    skip=$((total - n)); [ $skip -lt 0 ] && skip=0",
+    "    dd bs=1 skip=$skip < \"$f\" 2>/dev/null",
+    "    [ $# -eq 0 ] && rm -f \"$f\"",
+    "    return 0",
+    "  fi",
+    "  command tail \"$@\"",
+    "}",
   ].join("\n");
   const script = options.args ? null : `cd ${mount}\n${ECHO_SHIM}\n${command ?? ""}`;
   worker.postMessage(
