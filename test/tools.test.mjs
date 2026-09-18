@@ -212,6 +212,14 @@ describe("text tools", () => {
     expect(f.store.statSync("/workspace/existing.txt").mode & 0o777).toBe(0o755);
   });
 
+  it("head/tail byte counts via the _head/_tail builtins", () => {
+    const f = fixture();
+    expect(f.run("_head", ["3", "/workspace/existing.txt"]).out).toBe("lin");
+    expect(f.run("_tail", ["3", "/workspace/existing.txt"]).out).toBe("wo\n");
+    expect(f.run("_head", ["3"], { stdin: "abcdef" }).out).toBe("abc");
+    expect(f.run("_tail", ["2"], { stdin: "abcdef" }).out).toBe("ef");
+  });
+
   it("which knows builtins and applets", () => {
     const f = fixture();
     expect(f.run("which", ["jq", "tar"]).out).toBe("/usr/bin/jq\n/usr/bin/tar\n");

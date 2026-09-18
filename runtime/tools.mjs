@@ -1265,6 +1265,24 @@ export function makeExtraTools({ store, nested, net }) {
     return found ? 0 : 1;
   };
 
+  // ------------------------------------------------------------------- head
+  // `-c` for head/tail: busybox here has neither -c nor dd, so the shell
+  // prologue forwards the byte-count form to these two (argv: N [file]).
+  const headBytes = (ctx) => {
+    const argv = argsOf(ctx);
+    const count = Math.max(0, Number(argv[0] ?? 0));
+    const bytes = argv[1] ? read(ctx, argv[1]) : stdinBytes(ctx);
+    ctx.stdout(bytes.subarray(0, count));
+    return 0;
+  };
+  const tailBytes = (ctx) => {
+    const argv = argsOf(ctx);
+    const count = Math.max(0, Number(argv[0] ?? 0));
+    const bytes = argv[1] ? read(ctx, argv[1]) : stdinBytes(ctx);
+    ctx.stdout(bytes.subarray(Math.max(0, bytes.length - count)));
+    return 0;
+  };
+
   const tools = {
     which,
     whoami,
@@ -1294,6 +1312,8 @@ export function makeExtraTools({ store, nested, net }) {
     uptime,
     chmod,
     fd,
+    _head: headBytes,
+    _tail: tailBytes,
   };
   return tools;
 }
