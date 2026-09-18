@@ -63,6 +63,8 @@ describe("jq", () => {
 
   it("streams, pipes and select", () => {
     expect(jq("-r .b[] | .x").out).toBe("2\n3\n");
+    expect(jq("-c [.[]]").out).toBe('[1,[{"x":2},{"x":3}],"hi there",2.7]\n');
+    expect(jq("-c .[] | length").out).toBe("1\n2\n8\n2.7\n");
     expect(jq("-c [.b[] | select(.x > 2) | .x]").out).toBe("[3]\n");
     expect(jq("-c .b | map(.x + 1)").out).toBe("[3,4]\n");
     expect(jq("-c .b | map(.x) | add").out).toBe("5\n");

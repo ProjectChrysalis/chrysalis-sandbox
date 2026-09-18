@@ -518,7 +518,9 @@ export function makeExtraTools({ store, nested, net }) {
       const steps = [];
       if (start === ".") {
         pos++;
-        steps.push({ k: "key", value: parseSegment() });
+        ws();
+        // `.[]` and `.[0]` start with a bracket, not a key
+        if (text[pos] !== "[") steps.push({ k: "key", value: parseSegment() });
       }
       for (;;) {
         ws();
@@ -724,20 +726,20 @@ export function makeExtraTools({ store, nested, net }) {
         const first = inputs[0];
         const arg = (i) => (node.args[i] ? evaluateJq(node.args[i], inputs) : []);
         switch (node.name) {
-          case "length": return [jqLength(first)];
-          case "keys": return [jqKeys(first)];
-          case "type": return [jqType(first)];
+          case "length": return inputs.map(jqLength);
+          case "keys": return inputs.map(jqKeys);
+          case "type": return inputs.map(jqType);
           case "first": return node.args.length ? evaluateJq(node.args[0], inputs).slice(0, 1) : [Array.isArray(first) ? first[0] : first];
           case "last": return node.args.length ? evaluateJq(node.args[0], inputs).slice(-1) : [Array.isArray(first) ? first[first.length - 1] : first];
-          case "add": return [jqSum(first)];
+          case "add": return inputs.map(jqSum);
           case "tostring": return inputs.map((v) => (typeof v === "string" ? v : JSON.stringify(v)));
           case "tonumber": return inputs.map((v) => Number(v));
           case "tojson": return inputs.map((v) => JSON.stringify(v));
           case "fromjson": return inputs.map((v) => JSON.parse(String(v)));
           case "ascii_downcase": return inputs.map((v) => String(v).toLowerCase());
           case "ascii_upcase": return inputs.map((v) => String(v).toUpperCase());
-          case "split": return [String(first).split(String(arg(0)[0] ?? ""))];
-          case "join": return [Array.isArray(first) ? first.map((v) => String(v ?? "")).join(String(arg(0)[0] ?? "")) : String(first)];
+          case "split": return inputs.map((v) => String(v).split(String(arg(0)[0] ?? "")));
+          case "join": return inputs.map((v) => (Array.isArray(v) ? v.map((x) => String(x ?? "")).join(String(arg(0)[0] ?? "")) : String(v)));
           case "map": return [evaluateJq(node.args[0], Array.isArray(first) ? first : [first])];
           case "select": {
             const kept = [];
@@ -752,11 +754,11 @@ export function makeExtraTools({ store, nested, net }) {
           }
           case "any": return [inputs.some((v) => (Array.isArray(v) ? v.some(jqTruthy) : jqTruthy(v)))];
           case "all": return [inputs.every((v) => (Array.isArray(v) ? v.every(jqTruthy) : jqTruthy(v)))];
-          case "contains": return [JSON.stringify(first).includes(String(arg(0)[0]))];
-          case "startswith": return [String(first).startsWith(String(arg(0)[0]))];
-          case "endswith": return [String(first).endsWith(String(arg(0)[0]))];
-          case "ltrimstr": return [typeof first === "string" && first.startsWith(String(arg(0)[0])) ? first.slice(String(arg(0)[0]).length) : first];
-          case "rtrimstr": return [typeof first === "string" && first.endsWith(String(arg(0)[0])) ? first.slice(0, -String(arg(0)[0]).length) : first];
+          case "contains": return inputs.map((v) => JSON.stringify(v).includes(String(arg(0)[0])));
+          case "startswith": return inputs.map((v) => String(v).startsWith(String(arg(0)[0])));
+          case "endswith": return inputs.map((v) => String(v).endsWith(String(arg(0)[0])));
+          case "ltrimstr": return inputs.map((v) => (typeof v === "string" && v.startsWith(String(arg(0)[0])) ? v.slice(String(arg(0)[0]).length) : v));
+          case "rtrimstr": return inputs.map((v) => (typeof v === "string" && v.endsWith(String(arg(0)[0])) ? v.slice(0, -String(arg(0)[0]).length) : v));
           case "floor": return inputs.map((v) => Math.floor(Number(v)));
           case "ceil": return inputs.map((v) => Math.ceil(Number(v)));
           case "round": return inputs.map((v) => Math.round(Number(v)));
