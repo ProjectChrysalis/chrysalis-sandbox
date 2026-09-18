@@ -1,7 +1,7 @@
 {
   "runtime": {
     "name": "chrysalis-sandbox",
-    "version": "0.3.2",
+    "version": "0.3.3",
     "license": "GPL-2.0-only",
     "source": "https://github.com/ProjectChrysalis/chrysalis-sandbox",
     "note": "the runtime links busybox and wasm-git (both GPL-2.0-only), so the combined work is GPL-2.0-only; wasi-sh (ISC), MicroPython (MIT), QuickJS (MIT) and fflate (MIT) are compatible"

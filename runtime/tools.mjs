@@ -10,7 +10,7 @@ const decoder = new TextDecoder();
 const HOST_BUILTINS = new Set([
   "which", "whoami", "id", "hostname", "base64", "readlink", "tee", "ln", "tree",
   "rg", "jq", "diff", "cmp", "gzip", "gunzip", "zcat", "tar", "zip", "unzip", "timeout",
-  "wget", "file", "strings", "ps", "df", "uptime",
+  "wget", "file", "strings", "ps", "df", "uptime", "chmod",
   "python3", "python", "node", "nodejs", "git", "curl", "bash", "dash",
 ]);
 
@@ -769,6 +769,56 @@ export function makeExtraTools({ store, nested, net }) {
     return 0;
   };
 
+  // ------------------------------------------------------------------ chmod
+  const chmod = (ctx) => {
+    const argv = argsOf(ctx);
+    const recursive = argv.includes("-R") || argv.includes("-r");
+    const rest = argv.filter((a) => !a.startsWith("-"));
+    const [spec, ...paths] = rest;
+    if (!spec || !paths.length) return fail(ctx, "chmod: usage: chmod [-R] MODE FILE...");
+    const applyOne = (path) => {
+      let current;
+      try {
+        current = store.statSync(path).mode & 0o777;
+      } catch {
+        return false;
+      }
+      let next;
+      if (/^[0-7]{3,4}$/.test(spec)) {
+        next = Number.parseInt(spec, 8);
+      } else {
+        const m = spec.match(/^([ugoa]*)([+\-=])([rwxXst]*)$/);
+        if (!m) return false;
+        const who = m[1] || "a";
+        let mask = 0;
+        for (const letter of m[3]) {
+          const bits = letter === "r" ? 0o4 : letter === "w" ? 0o2 : 0o1;
+          if (who === "a" || who.includes("u")) mask |= bits << 6;
+          if (who === "a" || who.includes("g")) mask |= bits << 3;
+          if (who === "a" || who.includes("o")) mask |= bits;
+        }
+        next = m[2] === "+" ? current | mask : m[2] === "-" ? current & ~mask : mask;
+      }
+      try {
+        store.touchSync(path, { mode: next });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let failed = false;
+    for (const name of paths) {
+      const path = resolve(ctx, name);
+      if (recursive && isDir(path)) {
+        for (const file of walk(path)) if (!applyOne(file)) failed = true;
+      } else if (!applyOne(path)) {
+        ctx.stderr(`chmod: cannot access '${name}'\n`);
+        failed = true;
+      }
+    }
+    return failed ? 1 : 0;
+  };
+
   const tools = {
     which,
     whoami,
@@ -796,6 +846,7 @@ export function makeExtraTools({ store, nested, net }) {
     ps,
     df,
     uptime,
+    chmod,
   };
   return tools;
 }

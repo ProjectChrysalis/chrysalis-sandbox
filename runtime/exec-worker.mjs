@@ -9,12 +9,13 @@ self.onmessage = async (event) => {
   if (!message || message.type !== "exec") return;
   const reply = { type: "result", id: message.id };
   try {
-    const out = await exec(message.command, { files: message.files ?? {}, gitProxy: message.gitProxy });
+    const out = await exec(message.command, { files: message.files ?? {}, scratch: message.scratch ?? {}, gitProxy: message.gitProxy });
     Object.assign(reply, {
       exitCode: out.exitCode,
       stdout: out.stdout,
       stderr: out.stderr,
       files: out.files,
+      scratch: out.scratch,
       wallMs: out.wallMs,
     });
   } catch (error) {
@@ -23,6 +24,7 @@ self.onmessage = async (event) => {
       stdout: "",
       stderr: `sandbox error: ${(error && error.message) || error}`,
       files: {},
+      scratch: {},
       wallMs: 0,
     });
   }

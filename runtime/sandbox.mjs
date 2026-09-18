@@ -69,10 +69,20 @@ export async function exec(command, options = {}) {
     const guest = clean === mount || clean.startsWith(`${mount}/`) ? clean : `${mount}/${clean.replace(/^\/+/, "")}`;
     files[guest] = content instanceof Uint8Array ? content : new TextEncoder().encode(String(content));
   }
+  // /tmp is scratch space the caller carries between commands (the engine only
+  // syncs /workspace); seeding it again is what makes `cat > /tmp/x && sh /tmp/x`
+  // work across separate runs.
+  for (const [path, content] of Object.entries(options.scratch ?? {})) {
+    const clean = path.replace(/\/+/g, "/");
+    if (!clean.startsWith("/tmp/")) continue;
+    files[clean] = content instanceof Uint8Array ? content : new TextEncoder().encode(String(content));
+  }
 
   // The busybox build has no fancy echo: `echo -n` would print a literal -n,
   // which breaks scripts. Define a POSIX-ish echo up front so every command
-  // in this session sees the expected behavior.
+  // in this session sees the expected behavior. `sh`/`ash` forward to the
+  // nested-shell builtin: the applet replaces the whole session when it runs a
+  // script, which silently swallows the rest of the command line.
   const ECHO_SHIM = [
     "echo() {",
     "  nl=1; esc=0",
@@ -89,6 +99,8 @@ export async function exec(command, options = {}) {
     "  [ $nl = 1 ] && printf '\\n'",
     "  return 0",
     "}",
+    "sh() { bash \"$@\"; }",
+    "ash() { bash \"$@\"; }",
   ].join("\n");
   const script = options.args ? null : `cd ${mount}\n${ECHO_SHIM}\n${command ?? ""}`;
   worker.postMessage(
@@ -128,15 +140,20 @@ export async function exec(command, options = {}) {
 
   const decode = (chunks) => new TextDecoder().decode(concat(chunks));
   const out = {};
+  const scratch = {};
   for (const file of snapshot) {
-    if (!file.path.startsWith(`${mount}/`)) continue;
-    out[file.path.slice(mount.length + 1)] = file.content;
+    if (file.path.startsWith(`${mount}/`)) {
+      out[file.path.slice(mount.length + 1)] = file.content;
+    } else if (file.path.startsWith("/tmp/")) {
+      scratch[file.path] = file.content;
+    }
   }
   return {
     exitCode,
     stdout: decode(stdout),
     stderr: decode(stderr),
     files: out,
+    scratch,
     wallMs: Math.round(performance.now() - started),
   };
 }
