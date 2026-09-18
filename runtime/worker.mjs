@@ -981,6 +981,8 @@ async function builtins() {
         let code = 0;
         try {
           let args = userArgsOf(ctx);
+          // the CLI has no -A/--all; "." adds every change the same way
+          if (args[0] === "add") args = args.map((a) => (a === "-A" || a === "--all" ? "." : a));
           if (gitProxy) args = args.map((a) => (/^https?:\/\//.test(a) ? proxied(a) : a));
           // The libgit2 CLI takes a smaller option surface than git; drop the
           // flags it cannot parse (and their values) with a warning instead of

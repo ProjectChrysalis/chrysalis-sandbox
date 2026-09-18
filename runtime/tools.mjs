@@ -10,7 +10,7 @@ const decoder = new TextDecoder();
 const HOST_BUILTINS = new Set([
   "which", "whoami", "id", "hostname", "base64", "readlink", "tee", "ln", "tree",
   "rg", "jq", "diff", "cmp", "gzip", "gunzip", "zcat", "tar", "zip", "unzip", "timeout",
-  "wget", "file", "strings", "ps", "df", "uptime", "chmod",
+  "wget", "file", "strings", "ps", "df", "uptime", "chmod", "fd",
   "python3", "python", "node", "nodejs", "git", "curl", "bash", "dash",
 ]);
 
@@ -1204,6 +1204,39 @@ export function makeExtraTools({ store, nested, net }) {
     return failed ? 1 : 0;
   };
 
+
+  // --------------------------------------------------------------------- fd
+  const fd = (ctx) => {
+    const argv = argsOf(ctx);
+    let hidden = false;
+    let type = null;
+    let ext = null;
+    const rest = [];
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === "-H" || a === "--hidden" || a === "-u" || a === "--no-ignore") hidden = true;
+      else if (a === "-t" || a === "--type") type = argv[++i];
+      else if (a === "-e" || a === "--extension") ext = String(argv[++i] ?? "").replace(/^\./, "");
+      else if (a.startsWith("-")) continue;
+      else rest.push(a);
+    }
+    const pattern = rest.length > 1 || (rest.length === 1 && !isDir(resolve(ctx, rest[0]))) ? rest.shift() : null;
+    const root = resolve(ctx, rest[0] ?? ".");
+    const re = pattern ? new RegExp(pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i") : null;
+    let found = false;
+    for (const path of walk(root)) {
+      const name = path.split("/").pop() ?? "";
+      if (!hidden && name.startsWith(".")) continue;
+      if (type === "f" && isDir(path)) continue;
+      if (type === "d") continue;
+      if (ext && !name.endsWith(`.${ext}`)) continue;
+      if (re && !re.test(name)) continue;
+      found = true;
+      ctx.stdout(`${display(ctx, path)}\n`);
+    }
+    return found ? 0 : 1;
+  };
+
   const tools = {
     which,
     whoami,
@@ -1232,6 +1265,7 @@ export function makeExtraTools({ store, nested, net }) {
     df,
     uptime,
     chmod,
+    fd,
   };
   return tools;
 }
