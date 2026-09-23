@@ -1,0 +1,176 @@
+--- a/build/shim/wasistubs.c
++++ b/build/shim/wasistubs.c
+@@ -44,7 +44,6 @@
+ int getrlimit(int r, struct rlimit *l){ (void)r;(void)l; return 0; }
+ int setrlimit(int r, const struct rlimit *l){ (void)r;(void)l; return 0; }
+ /* process/permission/misc stubs (browser: no users, no exec) */
+-int system(const char*c){ (void)c; return -1; }
+ unsigned getuid(void){ return 0; } unsigned geteuid(void){ return 0; }
+ unsigned getgid(void){ return 0; } unsigned getegid(void){ return 0; }
+ int setuid(unsigned u){ (void)u; return 0; } int setgid(unsigned g){ (void)g; return 0; }
+@@ -331,16 +330,12 @@
+   if (fd != newfd) close(fd);
+   return 0;
+ }
+-int ftruncate(int fd,long long len){ (void)fd;(void)len; errno=ENOSYS; return -1; }
+-int truncate(const char*p,long long len){ (void)p;(void)len; errno=ENOSYS; return -1; }
+ /* referenced by enabled applets; without definitions they become unresolvable
+  * env.* imports and the module cannot instantiate */
+ int getgrouplist(const char*u,unsigned g,unsigned*gs,int*n){ (void)u;(void)g;(void)gs; if(n)*n=0; return 0; }
+ int sync2(void) __asm__("sync");
+ int sync2(void){ return 0; }
+ int sched_getaffinity(int p,unsigned long s,void*m){ (void)p;(void)s;(void)m; errno=ENOSYS; return -1; }
+-void *popen(const char*c,const char*m){ (void)c;(void)m; errno=ENOSYS; return 0; }
+-int pclose(void*f){ (void)f; return -1; }
+ 
+ /* ---- host builtins (see ARCHITECTURE.md, build/ash-hostbuiltin.patch) ----
+  * The embedder registers command names in JS; the patched find_command()
+@@ -407,3 +402,148 @@
+ 	r = __host_builtin_run(cwd, argc, argv, envp);
+ 	return r < 0 ? -1 : (r & 0xFF);   /* WEXITSTATUS-style clamp */
+ }
++
++/* ---- child commands: spawn_and_wait, system(), popen() ----
++ * There is no fork, so a command busybox would run as a child (xargs, find
++ * -exec, awk's system() and pipes, sed's `e`) is handed to the embedder, which
++ * runs it to completion on the same filesystem and the same fds 0/1/2, then
++ * returns its exit status. Output buffered in stdio is flushed first so the
++ * child's lines land after the parent's, as they would with a real fork. */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++extern char **environ;
++extern int unlink(const char *path);
++extern int __host_spawn(const char *cwd, int argc, char **argv, char **envp);
++int host_spawn_and_wait(char **argv)
++{
++	static char cwd[PATH_MAX];
++	int argc = 0, r;
++	while (argv[argc]) argc++;
++	if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = '\0'; }
++	fflush(NULL);
++	r = __host_spawn(cwd, argc, argv, environ);
++	return r < 0 ? 127 : (r & 0xFF);
++}
++int system(const char *cmd)
++{
++	char *argv[4];
++	if (!cmd) return 1;
++	argv[0] = (char *)"sh"; argv[1] = (char *)"-c"; argv[2] = (char *)cmd; argv[3] = 0;
++	return host_spawn_and_wait(argv) << 8;
++}
++/* popen runs the command through a scratch file: "r" runs it at once into the
++ * file and hands back a stream over the result; "w" collects what is written
++ * and runs the command on it at pclose(), which is when a real pipe's reader
++ * would have seen end of input. */
++struct popen_rec { FILE *f; char *cmd; char path[64]; struct popen_rec *next; };
++static struct popen_rec *popen_list;
++static unsigned popen_seq;
++static int popen_run(const char *cmd, const char *redir, const char *path)
++{
++	size_t n = strlen(cmd) + strlen(path) + 16;
++	char *line = malloc(n);
++	int r;
++	if (!line) { errno = ENOMEM; return -1; }
++	snprintf(line, n, "{ %s\n} %s '%s'", cmd, redir, path);
++	r = system(line);
++	free(line);
++	return r;
++}
++FILE *popen(const char *cmd, const char *mode)
++{
++	struct popen_rec *rec = calloc(1, sizeof *rec);
++	if (!rec) { errno = ENOMEM; return 0; }
++	snprintf(rec->path, sizeof rec->path, "/tmp/.popen-%u", ++popen_seq);
++	if (mode[0] == 'r') {
++		popen_run(cmd, ">", rec->path);
++		rec->f = fopen(rec->path, "r");
++		unlink(rec->path);
++	} else {
++		rec->cmd = strdup(cmd);
++		rec->f = fopen(rec->path, "w");
++	}
++	if (!rec->f) { free(rec->cmd); free(rec); return 0; }
++	rec->next = popen_list;
++	popen_list = rec;
++	return rec->f;
++}
++int pclose(FILE *f)
++{
++	struct popen_rec **at = &popen_list, *rec;
++	int r = 0;
++	while (*at && (*at)->f != f) at = &(*at)->next;
++	if (!(rec = *at)) { errno = ECHILD; return -1; }
++	*at = rec->next;
++	fclose(f);
++	if (rec->cmd) {
++		r = popen_run(rec->cmd, "<", rec->path);
++		unlink(rec->path);
++		free(rec->cmd);
++	}
++	free(rec);
++	return r;
++}
++
++/* ---- permission bits ----
++ * WASI's filestat carries no mode, so wasi-libc reports every permission bit
++ * as 0 and `ls -l` shows ----------. The embedder's store keeps real modes
++ * (chmod sets them); these wrappers ask it through __host_mode, which takes an
++ * absolute path, or a path relative to an open directory fd, or just an fd. */
++#include <sys/stat.h>
++#include <fcntl.h>
++extern int __host_mode(const char *path, int fd);
++static void with_mode(struct stat *st, const char *path, int fd)
++{
++	int mode = __host_mode(path, fd);
++	if (mode >= 0)
++		st->st_mode = (st->st_mode & S_IFMT) | (mode & 07777);
++	else if (!(st->st_mode & 07777))
++		st->st_mode |= S_ISDIR(st->st_mode) ? 0755 : 0644;
++	/* no block counts either: du reads them */
++	st->st_blksize = 4096;
++	if (!st->st_blocks) st->st_blocks = (st->st_size + 511) / 512;
++}
++static const char *absolute(const char *path, char *buf, size_t size)
++{
++	size_t n;
++	if (path[0] == '/' || !getcwd(buf, size)) return path;
++	n = strlen(buf);
++	if (n + strlen(path) + 2 > size) return path;
++	if (n > 1) buf[n++] = '/';
++	strcpy(buf + n, path);
++	return buf;
++}
++extern int __real_stat(const char *path, struct stat *st);
++extern int __real_lstat(const char *path, struct stat *st);
++extern int __real_fstat(int fd, struct stat *st);
++extern int __real_fstatat(int dirfd, const char *path, struct stat *st, int flags);
++int __wrap_stat(const char *path, struct stat *st)
++{
++	static char buf[PATH_MAX];
++	int r = __real_stat(path, st);
++	if (!r) with_mode(st, absolute(path, buf, sizeof buf), -1);
++	return r;
++}
++int __wrap_lstat(const char *path, struct stat *st)
++{
++	static char buf[PATH_MAX];
++	int r = __real_lstat(path, st);
++	if (!r) with_mode(st, absolute(path, buf, sizeof buf), -1);
++	return r;
++}
++int __wrap_fstat(int fd, struct stat *st)
++{
++	int r = __real_fstat(fd, st);
++	if (!r) with_mode(st, 0, fd);
++	return r;
++}
++int __wrap_fstatat(int dirfd, const char *path, struct stat *st, int flags)
++{
++	static char buf[PATH_MAX];
++	int r = __real_fstatat(dirfd, path, st, flags);
++	if (r) return r;
++	if (dirfd == AT_FDCWD || path[0] == '/') with_mode(st, absolute(path, buf, sizeof buf), -1);
++	else with_mode(st, path, dirfd);
++	return r;
++}

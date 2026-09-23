@@ -16,9 +16,11 @@ jobs:
         with:
           bun-version: latest
       - run: bun install
-      - run: bun run release
+      - run: bun run build:python
+      - run: bun test
+      - run: bun run pack
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            sandbox-k-*.zip
+            sandbox-*.zip
             SHA256SUMS

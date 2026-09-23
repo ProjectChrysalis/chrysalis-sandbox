@@ -1,20 +1,24 @@
 {
   "runtime": {
     "name": "chrysalis-sandbox",
-    "version": "0.3.9",
+    "version": "0.4.0",
     "license": "GPL-2.0-only",
     "source": "https://github.com/ProjectChrysalis/chrysalis-sandbox",
-    "note": "the runtime links busybox and wasm-git (both GPL-2.0-only), so the combined work is GPL-2.0-only; wasi-sh (ISC), MicroPython (MIT), QuickJS (MIT) and fflate (MIT) are compatible"
+    "note": "the runtime links busybox and wasm-git (both GPL-2.0-only), so the combined work is GPL-2.0-only; the other parts are under compatible licenses"
   },
   "wasi-sh": {
     "version": "0.11.0",
     "license": "ISC",
     "source": "https://github.com/alganet/wasi-sh",
-    "vendored": [
-      "vendor/wasi-sh/src",
-      "vendor/wasi-sh/dist/busybox.wasm"
-    ],
-    "note": "fork-free shell + busybox ash/applets compiled to wasm32-wasi"
+    "vendored": ["vendor/wasi-sh/src"],
+    "note": "fork-free WASI runtime: shim, host builtins, in-memory pipes"
+  },
+  "busybox": {
+    "version": "1.38.0",
+    "license": "GPL-2.0-only",
+    "source": "https://busybox.net",
+    "vendored": ["vendor/wasi-sh/dist/busybox.wasm"],
+    "build": "scripts/build-busybox.sh (wasi-sh 0.11.0's build with busybox/busybox.config and busybox/*.patch)"
   },
   "wasm-git": {
     "version": "0.0.17",
@@ -22,45 +26,34 @@
     "source": "https://github.com/petersalomonsen/wasm-git",
     "library": "libgit2 1.9.4 (GPL-2.0-only with linking exception)",
     "librarySource": "https://libgit2.org",
-    "vendored": [
-      "vendor/wasm-git/lg2.js",
-      "vendor/wasm-git/lg2.wasm",
-      "vendor/wasm-git/COPYING"
-    ]
+    "vendored": ["vendor/wasm-git/lg2.js", "vendor/wasm-git/lg2.wasm", "vendor/wasm-git/COPYING"]
   },
-  "micropython": {
-    "version": "wasi variant",
-    "license": "MIT",
-    "source": "https://github.com/micropython/micropython",
-    "artifact": "https://github.com/bamggm/micropython-wasm",
-    "vendored": [
-      "vendor/micropython/micropython-wasi.wasm"
-    ]
+  "cpython": {
+    "version": "3.14.7",
+    "license": "PSF-2.0",
+    "source": "https://github.com/python/cpython",
+    "artifact": "https://github.com/brettcannon/cpython-wasi-build",
+    "vendored": ["vendor/python/python.wasm", "vendor/python/python314.zip", "vendor/python/LICENSE"],
+    "build": "scripts/build-python.ts"
+  },
+  "jq": {
+    "version": "1.7.1",
+    "license": "MIT (jq), BSD-2-Clause (oniguruma)",
+    "source": "https://github.com/jqlang/jq",
+    "vendored": ["vendor/jq/jq.wasm", "vendor/jq/COPYING"],
+    "build": "scripts/build-jq.sh"
   },
   "quickjs-ng": {
     "version": "wasmfile-release-sync",
     "license": "MIT",
     "source": "https://github.com/quickjs-ng/quickjs",
     "package": "@jitl/quickjs-ng-wasmfile-release-sync",
-    "vendored": [
-      "vendor/quickjs/quickjs.mjs",
-      "vendor/quickjs/emscripten-module.wasm"
-    ]
+    "vendored": ["vendor/quickjs/quickjs.mjs", "vendor/quickjs/emscripten-module.wasm"]
   },
   "fflate": {
     "version": "0.8.3",
     "license": "MIT",
     "source": "https://github.com/101arrowz/fflate",
-    "vendored": [
-      "vendor/fflate/fflate.mjs"
-    ]
-  },
-  "busybox": {
-    "version": "wasi-sh 0.11.0 build",
-    "license": "GPL-2.0-only",
-    "source": "https://busybox.net",
-    "vendored": [
-      "vendor/wasi-sh/dist/busybox.wasm"
-    ]
+    "vendored": ["vendor/fflate/fflate.mjs"]
   }
 }

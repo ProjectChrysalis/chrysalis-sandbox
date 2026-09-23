@@ -1,0 +1,172 @@
+--- a/findutils/grep.c
++++ b/findutils/grep.c
+@@ -56,6 +56,7 @@
+ #include "libbb.h"
+ #include "common_bufsiz.h"
+ #include "xregex.h"
++#include <fnmatch.h>
+ 
+ //usage:#define grep_trivial_usage
+ //usage:       "[-HhnlLoqvsrRiwFE"
+@@ -163,6 +164,7 @@
+ 	OPT_C = IF_FEATURE_GREP_CONTEXT(    (1 << OPTBIT_C)) + 0,
+ 	OPT_E = 1 << OPTBIT_E,
+ 	OPT_z = IF_EXTRA_COMPAT(            (1 << OPTBIT_z)) + 0,
++	OPT_a = 1 << (OPTBIT_E + 1 + ENABLE_EXTRA_COMPAT),
+ };
+ 
+ #define PRINT_LINE_NUM              (option_mask32 & OPT_n)
+@@ -654,11 +656,106 @@
+ 		llist_add_to(lst, new_grep_list_data(p, 0));
+ }
+ 
++/* GNU-style filters for -r: --include and --exclude match a file's name,
++ * --exclude-dir a directory's, as shell globs with {a,b} alternatives. They
++ * are taken out of argv before option parsing. Applets run in-process here,
++ * so every list is reset on entry rather than left to a previous grep. */
++static llist_t *include_globs, *exclude_globs, *exclude_dir_globs;
++static smallint implicit_dot;
++
++static int brace_fnmatch(const char *pat, const char *name)
++{
++	const char *open = strchr(pat, '{');
++	const char *close, *alt;
++	if (!open || !(close = strchr(open, '}')))
++		return fnmatch(pat, name, 0) == 0;
++	for (alt = open + 1; alt <= close; ) {
++		const char *end = alt;
++		char *one;
++		int hit;
++		while (end < close && *end != ',')
++			end++;
++		one = xasprintf("%.*s%.*s%s", (int)(open - pat), pat, (int)(end - alt), alt, close + 1);
++		hit = brace_fnmatch(one, name);
++		free(one);
++		if (hit)
++			return 1;
++		alt = end + 1;
++	}
++	return 0;
++}
++
++static int glob_hit(llist_t *list, const char *name)
++{
++	for (; list; list = list->link)
++		if (brace_fnmatch(list->data, name))
++			return 1;
++	return 0;
++}
++
++static void take_path_filters(char **argv)
++{
++	char **in = argv + 1, **out = argv + 1;
++	include_globs = exclude_globs = exclude_dir_globs = NULL;
++	implicit_dot = 0;
++	while (*in) {
++		char *arg = *in++;
++		llist_t **list = NULL;
++		const char *rest = NULL;
++		if (strcmp(arg, "--") == 0) {
++			*out++ = arg;
++			while (*in)
++				*out++ = *in++;
++			break;
++		}
++		if ((rest = is_prefixed_with(arg, "--include")) != NULL)
++			list = &include_globs;
++		else if ((rest = is_prefixed_with(arg, "--exclude-dir")) != NULL)
++			list = &exclude_dir_globs;
++		else if ((rest = is_prefixed_with(arg, "--exclude")) != NULL)
++			list = &exclude_globs;
++		if (list && *rest == '=') {
++			llist_add_to(list, (char *)rest + 1);
++			continue;
++		}
++		if (list && *rest == '\0' && *in) {
++			llist_add_to(list, *in++);
++			continue;
++		}
++		*out++ = arg;
++	}
++	*out = NULL;
++}
++
++/* A NUL in the first block marks a binary file, which -r skips unless -a. */
++static int looks_binary(FILE *file)
++{
++	char buf[4096];
++	size_t n = fread(buf, 1, sizeof buf, file);
++	rewind(file);
++	return memchr(buf, 0, n) != NULL;
++}
++
++static int FAST_FUNC dir_action_grep(struct recursive_state *state,
++		const char *dirname,
++		struct stat *statbuf UNUSED_PARAM)
++{
++	if (state->depth && exclude_dir_globs && glob_hit(exclude_dir_globs, bb_basename(dirname)))
++		return SKIP;
++	return TRUE;
++}
++
+ static int FAST_FUNC file_action_grep(struct recursive_state *state UNUSED_PARAM,
+ 		const char *filename,
+ 		struct stat *statbuf)
+ {
+ 	FILE *file;
++	const char *base = bb_basename(filename);
++
++	if (include_globs && !glob_hit(include_globs, base))
++		return 1;
++	if (exclude_globs && glob_hit(exclude_globs, base))
++		return 1;
+ 
+ 	/* If we are given a link to a directory, we should bail out now, rather
+ 	 * than trying to open the "file" and hoping getline gives us nothing,
+@@ -682,7 +779,11 @@
+ 		open_errors = 1;
+ 		return 0;
+ 	}
+-	cur_file = filename;
++	if (!(option_mask32 & OPT_a) && looks_binary(file)) {
++		fclose(file);
++		return 1;
++	}
++	cur_file = (implicit_dot && filename[0] == '.' && filename[1] == '/') ? filename + 2 : filename;
+ 	*(int*)state->userData |= grep_file(file);
+ 	fclose(file);
+ 	return 1;
+@@ -695,10 +796,9 @@
+ 		| ACTION_RECURSE
+ 		| ((option_mask32 & OPT_R) ? ACTION_FOLLOWLINKS : 0)
+ 		| ACTION_FOLLOWLINKS_L0 /* grep -r ... SYMLINK follows it */
+-		| ACTION_DEPTHFIRST
+ 		| 0,
+ 		/* fileAction= */ file_action_grep,
+-		/* dirAction= */ NULL,
++		/* dirAction= */ dir_action_grep,
+ 		/* userData= */ &matched
+ 	);
+ 	return matched;
+@@ -717,6 +817,7 @@
+ 
+ 	/* For grep, exitcode of 1 is "not found". Other errors are 2: */
+ 	xfunc_error_retval = 2;
++	take_path_filters(argv);
+ 
+ 	/* do normal option parsing */
+ #if ENABLE_FEATURE_GREP_CONTEXT
+@@ -817,6 +918,13 @@
+ 		load_pattern_list(&pattern_head, *argv++);
+ 	}
+ 
++	/* -r with no file searches the current directory, as GNU grep does. */
++	if (!*argv && (option_mask32 & (OPT_r|OPT_R))) {
++		static char *dot[] = { (char *)".", NULL };
++		argv = dot;
++		implicit_dot = 1;
++	}
++
+ 	/* argv[0..(argc-1)] should be names of file to grep through. If
+ 	 * there is more than one file to grep, we will print the filenames. */
+ 	if (argv[0] && argv[1])

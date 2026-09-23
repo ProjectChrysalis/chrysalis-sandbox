@@ -1,0 +1,15 @@
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -8808,6 +8808,12 @@
+ 
+ 	/* If name contains a slash, don't use PATH or hash table */
+ 	if (strchr(name, '/') != NULL) {
++		/* A path to a script: the host runs it by its #! line. */
++		if (host_builtin_lookup(name)) {
++			entry->cmdtype = CMDHOST;
++			entry->u.index = -1;
++			return;
++		}
+ 		entry->u.index = -1;
+ 		if (act & DO_ABS) {
+ 			while (stat(name, &statb) < 0) {

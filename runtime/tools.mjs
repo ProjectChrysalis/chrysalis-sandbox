@@ -1,1321 +1,1297 @@
-// Extra host builtins for the sandbox shell: the busybox build leaves gaps
-// (no which/base64/tee/rg/jq/archivers/diff) and agents reach for them.
-// Everything here works on the same in-memory store, synchronously.
+// Host commands for what busybox does not cover: rg, fd, jq (real jq, as its
+// own WASI program), curl/wget through the engine proxy, archives (tar, gzip,
+// zip) on fflate, and the small system commands scripts probe for.
+import { WasiShim, WasiExit } from "../vendor/wasi-sh/src/shim.mjs";
 import { gunzipSync, gzipSync, unzipSync, zipSync } from "../vendor/fflate/fflate.mjs";
+import { completeImports } from "./wasi-extra.mjs";
+import { preloadWasm, wasmSync } from "./loader.mjs";
+import { fixedInput } from "./shell.mjs";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const JQ = "vendor/jq/jq.wasm";
 
-/** Commands the runtime itself provides (native applets are listed separately). */
-const HOST_BUILTINS = new Set([
-  "which", "whoami", "id", "hostname", "base64", "readlink", "tee", "ln", "tree",
-  "rg", "jq", "diff", "cmp", "gzip", "gunzip", "zcat", "tar", "zip", "unzip", "timeout",
-  "wget", "file", "strings", "ps", "df", "uptime", "chmod", "fd",
-  "python3", "python", "node", "nodejs", "git", "curl", "bash", "dash",
-]);
+/** busybox applets in this build (busybox/busybox.config). */
+export const APPLETS = "ash awk base32 base64 basename bc cal cat cksum cmp comm cp crc32 cut date dc dd diff dirname dos2unix du echo egrep env expand expr factor false fgrep find fold getopt grep hd head hexdump install ls md5sum mkdir mktemp mv nl nproc od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum sha3sum sha512sum shuf sleep sort split stat strings stty sum tac tail tee test touch tr tree true truncate tsort uname unexpand uniq unix2dos unlink wc xargs xxd yes".split(" ");
 
-/** argv is [command, ...user args] for host builtins; some paths insert
- *  Emscripten's program name first, so drop it when it appears. */
-const argsOf = (ctx) => {
-  const a = ctx.argv.slice(1);
-  return a[0] === "./this.program" ? a.slice(1) : a;
-};
-const cwdOf = (ctx) => (typeof ctx.cwd === "string" && ctx.cwd.startsWith("/") ? ctx.cwd : "/workspace");
-/** POSIX-ish normalization: collapses //, . and .. so "." means the cwd. */
-const norm = (p) => {
-  const segments = [];
-  for (const part of String(p).split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") segments.pop();
-    else segments.push(part);
-  }
-  return `/${segments.join("/")}`;
-};
-const resolve = (ctx, p) => {
-  const s = String(p);
-  return norm(s.startsWith("/") ? s : `${cwdOf(ctx).replace(/\/$/, "")}/${s}`);
+export function preloadTools() {
+  return preloadWasm(JQ);
+}
+
+const RG_TYPES = {
+  js: ["js", "mjs", "cjs", "jsx"],
+  ts: ["ts", "tsx", "mts", "cts"],
+  py: ["py", "pyi"],
+  json: ["json", "jsonl"],
+  md: ["md", "markdown", "mdx"],
+  css: ["css", "scss", "sass", "less"],
+  html: ["html", "htm"],
+  yaml: ["yml", "yaml"],
+  toml: ["toml"],
+  sh: ["sh", "bash"],
+  rust: ["rs"],
+  go: ["go"],
+  java: ["java"],
+  c: ["c", "h"],
+  cpp: ["cpp", "cc", "hpp", "hh", "cxx"],
+  svg: ["svg"],
+  txt: ["txt"],
+  xml: ["xml"],
+  vue: ["vue"],
+  svelte: ["svelte"],
 };
 
-export function makeExtraTools({ store, nested, net }) {
-  const snapshot = () => store.snapshot();
-  const read = (ctx, p) => {
-    const path = resolve(ctx, p);
-    const bytes = snapshot()[path];
+export function makeTools({ store, net, shell }) {
+  const exists = (p) => store.exists(p);
+  const isDir = (p) => store.isDir(p);
+  const readFile = (ctx, p) => {
+    const path = ctx.resolve(p);
+    if (isDir(path)) throw new Error(`${p}: Is a directory`);
+    const bytes = store.readFile(path);
     if (!bytes) throw new Error(`${p}: No such file or directory`);
     return bytes;
   };
-  const write = (path, bytes) => {
-    store.createFileSync(path, 0o644);
-    store.writeSync(path, bytes, 0);
-    store.touchSync(path, { size: bytes.length });
+  const writeFile = (path, bytes) => {
+    store.mkdirp(path.slice(0, path.lastIndexOf("/")) || "/");
+    store.writeFile(path, bytes);
   };
-  const isDir = (path) => {
-    const base = `${path.replace(/\/$/, "")}/`;
-    return Object.keys(snapshot()).some((k) => k.startsWith(base));
-  };
-  const walk = (dir) => {
-    const base = `${dir.replace(/\/$/, "")}/`;
-    return Object.keys(snapshot())
-      .filter((k) => k.startsWith(base))
-      .sort();
-  };
-  const stdinBytes = (ctx) => (typeof ctx.stdin === "function" ? ctx.stdin() : new Uint8Array());
-  const fail = (ctx, message) => {
-    ctx.stderr(`${message}\n`);
-    return 1;
+  const display = (ctx, path, arg) => {
+    if (arg && arg.startsWith("/")) return path;
+    const base = ctx.cwd.replace(/\/$/, "");
+    if (path.startsWith(`${base}/`)) return path.slice(base.length + 1);
+    return path;
   };
 
-  // ---------------------------------------------------------------- identity
-  const whoami = (ctx) => {
-    ctx.stdout("sandbox\n");
-    return 0;
-  };
-  const id = (ctx) => {
-    ctx.stdout("uid=1000(sandbox) gid=1000(sandbox) groups=1000(sandbox)\n");
-    return 0;
-  };
-  const hostname = (ctx) => {
-    ctx.stdout("chrysalis-sandbox\n");
-    return 0;
-  };
-
-  // ------------------------------------------------------------------- which
-  const APPLETS = new Set(
-    "busybox sh ash cat ls cp mv rm rmdir mkdir ln chmod touch stat du dd df find grep egrep fgrep sed awk sort uniq head tail wc tr cut paste tee xargs expr test true false printf echo seq yes env printenv date sleep uname pwd id whoami hostname sync mktemp realpath dirname basename readlink sha256sum sha1sum md5sum cksum xxd hexdump od strings fold tac nl comm join split truncate file tree more less vi kill ps free uptime diff cmp patch tar gzip gunzip zcat bzip2 xz zip unzip wget nc ping login su passwd groups logname nohup nice ionice chrt taskset".split(" "),
-  );
+  // ---------------------------------------------------------- identity
   const which = (ctx) => {
     let missing = false;
-    for (const name of argsOf(ctx)) {
-      const known = APPLETS.has(name) || HOST_BUILTINS.has(name);
-      if (!known) {
-        missing = true;
+    for (const name of ctx.args.filter((a) => !a.startsWith("-"))) {
+      if (name.includes("/")) {
+        if (store.isFile(ctx.resolve(name))) ctx.print(`${name}\n`);
+        else missing = true;
         continue;
       }
-      ctx.stdout(`/usr/bin/${name}\n`);
+      if (shell.commands.has(name) || APPLETS.includes(name)) ctx.print(`/usr/bin/${name}\n`);
+      else missing = true;
     }
     return missing ? 1 : 0;
   };
 
-  // ------------------------------------------------------------------ base64
-  const base64 = (ctx) => {
-    const argv = argsOf(ctx);
-    const decode = argv.includes("-d") || argv.includes("--decode");
-    const files = argv.filter((a) => !a.startsWith("-"));
-    let data = files.length ? files.map((f) => read(ctx, f)).reduce((a, b) => concat(a, b), new Uint8Array()) : stdinBytes(ctx);
-    if (decode) {
-      const text = decoder.decode(data).replace(/\s+/g, "");
-      const bin = atob(text);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
-      ctx.stdout(out);
-    } else {
-      let bin = "";
-      for (let i = 0; i < data.length; i += 8192) bin += String.fromCharCode(...data.subarray(i, i + 8192));
-      ctx.stdout(`${btoa(bin)}\n`);
+  // ---------------------------------------------------------------- jq
+  const jq = (ctx) => {
+    const shim = new WasiShim({
+      args: ["jq", ...ctx.args],
+      env: { ...ctx.env, PWD: ctx.cwd },
+      files: {},
+      fs: store,
+      stdout: (b) => ctx.stdout(b),
+      stderr: (b) => ctx.stderr(b),
+      input: fixedInput(ctx.args.includes("-n") || ctx.args.includes("--null-input") ? new Uint8Array(0) : ctx.readAll()),
+    });
+    const instance = new WebAssembly.Instance(wasmSync(JQ), completeImports(shim, shim.imports()));
+    shim.bindMemory(instance.exports.memory);
+    try {
+      instance.exports._start();
+      return 0;
+    } catch (error) {
+      if (error instanceof WasiExit) return error.code;
+      return ctx.fail(`jq: ${(error && error.message) || error}`);
     }
-    return 0;
   };
-  const concat = (a, b) => {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
+
+  // ---------------------------------------------------------------- rg
+  const gitignores = new Map();
+  const ignoreRules = (dir) => {
+    if (gitignores.has(dir)) return gitignores.get(dir);
+    const bytes = store.readFile(`${dir}/.gitignore`);
+    const rules = [];
+    if (bytes) {
+      for (const raw of decoder.decode(bytes).split("\n")) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        const negate = line.startsWith("!");
+        let pattern = negate ? line.slice(1) : line;
+        const dirOnly = pattern.endsWith("/");
+        pattern = pattern.replace(/\/$/, "");
+        const anchored = pattern.includes("/");
+        rules.push({ negate, dirOnly, re: globRe(pattern.replace(/^\//, ""), anchored) });
+      }
+    }
+    gitignores.set(dir, rules);
+    return rules;
+  };
+  /** Walk `root`, yielding files; skips .git, hidden entries and
+   *  .gitignore'd paths unless told not to. */
+  function* walkFiles(root, { hidden = false, ignore = true, maxDepth = Infinity, dirs = false } = {}) {
+    if (!isDir(root)) {
+      if (exists(root)) yield root;
+      return;
+    }
+    const stack = [[root, 0, []]];
+    while (stack.length) {
+      const [dir, depth, inherited] = stack.pop();
+      const rules = ignore ? [...inherited, ...ignoreRules(dir).map((r) => ({ ...r, base: dir }))] : [];
+      const names = store.readdirSync(dir).sort().reverse();
+      const files = [];
+      for (const name of names) {
+        if (name === ".git") continue;
+        if (!hidden && name.startsWith(".")) continue;
+        const full = `${dir === "/" ? "" : dir}/${name}`;
+        const dir2 = isDir(full);
+        if (ignore && ignored(rules, full, dir2)) continue;
+        if (dir2) {
+          if (dirs && depth + 1 <= maxDepth) files.push(full);
+          if (depth + 1 < maxDepth) stack.push([full, depth + 1, rules]);
+        } else if (depth + 1 <= maxDepth) files.push(full);
+      }
+      yield* files.reverse();
+    }
+  }
+  const ignored = (rules, full, dir) => {
+    let out = false;
+    for (const r of rules) {
+      if (r.dirOnly && !dir) continue;
+      const rel = full.slice(r.base.length + 1);
+      if (r.re.test(rel)) out = !r.negate;
+    }
     return out;
   };
 
-  // ------------------------------------------------------- readlink / tee / ln
-  const readlink = (ctx) => {
-    const argv = argsOf(ctx).filter((a) => a !== "-f" && a !== "--canonicalize");
-    if (!argv.length) return fail(ctx, "readlink: missing operand");
-    for (const p of argv) ctx.stdout(`${resolve(ctx, p)}\n`);
-    return 0;
-  };
-  const tee = (ctx) => {
-    const argv = argsOf(ctx);
-    const append = argv.includes("-a");
-    const names = argv.filter((a) => !a.startsWith("-"));
-    const data = stdinBytes(ctx);
-    ctx.stdout(data);
-    for (const name of names) {
-      const path = resolve(ctx, name);
-      const next = append && snapshot()[path] ? concat(snapshot()[path], data) : data;
-      write(path, next);
-    }
-    return 0;
-  };
-  const ln = (ctx) => {
-    const argv = argsOf(ctx).filter((a) => !a.startsWith("-"));
-    if (argv.length !== 2) return fail(ctx, "ln: need a source and a destination");
-    const [target, link] = argv;
-    const bytes = read(ctx, target);
-    const path = resolve(ctx, link);
-    mkdirp(path);
-    write(path, bytes);
-    return 0;
-  };
-  const mkdirp = (path) => {
-    const segments = path.split("/").filter(Boolean);
-    let current = "";
-    for (const segment of segments) {
-      current += `/${segment}`;
-      try {
-        store.statSync(current);
-      } catch {
-        store.mkdirSync(current, 0o755);
-      }
-    }
-  };
-
-  // -------------------------------------------------------------------- tree
-  const tree = (ctx) => {
-    const argv = argsOf(ctx);
-    let depth = Number.POSITIVE_INFINITY;
-    let showAll = false;
-    const rest = [];
-    for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "-L") depth = Number(argv[++i] ?? 0);
-      else if (argv[i] === "-a") showAll = true;
-      else if (!argv[i].startsWith("-")) rest.push(argv[i]);
-    }
-    const root = resolve(ctx, rest[0] ?? ".");
-    let dirs = 0;
-    let files = 0;
-    const lines = [root];
-    const visit = (dir, prefix, level) => {
-      if (level > depth) return;
-      const names = new Set();
-      for (const path of walk(dir)) {
-        const rel = path.slice(dir.replace(/\/$/, "").length + 1);
-        names.add(rel.split("/")[0]);
-      }
-      const entries = [...names].sort().filter((name) => showAll || !name.startsWith("."));
-      entries.forEach((name, i) => {
-        const last = i === entries.length - 1;
-        const path = `${dir.replace(/\/$/, "")}/${name}`;
-        lines.push(`${prefix}${last ? "└── " : "├── "}${name}`);
-        if (isDir(path)) {
-          dirs++;
-          visit(path, `${prefix}${last ? "    " : "│   "}`, level + 1);
-        } else {
-          files++;
-        }
-      });
-    };
-    visit(root, "", 1);
-    ctx.stdout(`${lines.join("\n")}\n\n${dirs} directories, ${files} files\n`);
-    return 0;
-  };
-
-  // ---------------------------------------------------------------------- rg
   const rg = (ctx) => {
-    const argv = argsOf(ctx);
-    let ignoreCase = false;
-    let filesOnly = false;
-    let fixed = false;
-    let listFiles = false;
-    let glob = null;
+    const argv = ctx.args;
+    const o = { i: false, smart: false, F: false, w: false, x: false, v: false, n: true, l: false, L: false, c: false, o: false, q: false, files: false, hidden: false, ignore: true, before: 0, after: 0, max: Infinity, maxDepth: Infinity, filename: null, heading: false, onlyType: [], notType: [], globs: [] };
+    const patterns = [];
     const rest = [];
     for (let i = 0; i < argv.length; i++) {
       const a = argv[i];
-      if (a === "-i" || a === "--ignore-case") ignoreCase = true;
-      else if (a === "-F" || a === "--fixed-strings") fixed = true;
-      else if (a === "-l" || a === "--files-with-matches") filesOnly = true;
-      else if (a === "--files") listFiles = true;
-      else if (a === "-g" || a === "--glob") glob = argv[++i] ?? null;
-      else if (a === "-n" || a === "--line-number" || a === "-H" || a === "--with-filename" || a === "--no-heading" || a === "-S" || a === "--smart-case" || a === "--hidden" || a === "-uu" || a === "-u") continue;
-      else if (a.startsWith("-")) continue;
-      else rest.push(a);
-    }
-    const paths = rest.length > 1 ? rest.slice(1) : ["."];
-    const pattern = rest[0] ?? "";
-    const globRe = glob ? globToRegExp(glob) : null;
-    const matcher = fixed
-      ? (line) => (ignoreCase ? line.toLowerCase().includes(pattern.toLowerCase()) : line.includes(pattern))
-      : (() => {
-          let re;
-          try {
-            re = new RegExp(pattern, ignoreCase ? "i" : "");
-          } catch (e) {
-            return null;
-          }
-          return (line) => re.test(line);
-        })();
-    if (!matcher) return fail(ctx, `rg: invalid regex: ${pattern}`);
-    const targets = [];
-    for (const p of paths) {
-      const abs = resolve(ctx, p);
-      if (isDir(abs)) targets.push(...walk(abs).filter((path) => !path.includes("/.git/")));
-      else targets.push(abs);
-    }
-    let matched = false;
-    for (const path of targets) {
-      if (globRe && !globRe.test(path)) continue;
-      if (listFiles) {
-        ctx.stdout(`${display(ctx, path)}\n`);
-        continue;
-      }
-      const bytes = snapshot()[path];
-      if (!bytes || bytes.includes(0)) continue;
-      const lines = decoder.decode(bytes).split("\n");
-      let fileMatched = false;
-      lines.forEach((line, i) => {
-        if (!matcher(line)) return;
-        fileMatched = true;
-        if (filesOnly) return;
-        ctx.stdout(`${display(ctx, path)}:${i + 1}:${line}\n`);
-      });
-      if (fileMatched) matched = true;
-      if (fileMatched && filesOnly) ctx.stdout(`${display(ctx, path)}\n`);
-    }
-    return matched || listFiles ? 0 : 1;
-  };
-  const display = (ctx, path) => (path.startsWith("/workspace/") ? path.slice("/workspace/".length) : path);
-  const globToRegExp = (glob) => {
-    if (!glob.includes("*")) return new RegExp(`(^|/)${glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&")}$`);
-    const pattern = glob
-      .split(",")
-      .map((g) => g.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000").replace(/\*/g, "[^/]*").replace(/\u0000/g, ".*"))
-      .join("|");
-    return new RegExp(`(${pattern})$`);
-  };
-
-  // ---------------------------------------------------------------------- jq
-  // A small jq over value streams: paths, arithmetic/comparison/logic, pipes,
-  // array and object construction, and the functions agents actually use.
-  // Anything outside the grammar says "unsupported filter" instead of guessing.
-  const jq = (ctx) => {
-    const argv = argsOf(ctx);
-    let raw = false;
-    let compact = false;
-    let exitStatus = false;
-    const rest = [];
-    for (const a of argv) {
-      if (a === "-r" || a === "--raw-output") raw = true;
-      else if (a === "-c" || a === "--compact-output") compact = true;
-      else if (a === "-e" || a === "--exit-status") exitStatus = true;
-      else if (a === "-j" || a === "--join-output" || a === "-n" || a === "--null-input") continue;
-      else rest.push(a);
-    }
-    const filter = rest[0] ?? ".";
-    const file = rest[1];
-    let inputs;
-    if (argv.includes("-n") || argv.includes("--null-input")) inputs = [null];
-    else {
-      try {
-        inputs = [JSON.parse(decoder.decode(file ? read(ctx, file) : stdinBytes(ctx)))];
-      } catch {
-        return fail(ctx, "jq: invalid JSON input");
-      }
-    }
-    let values;
-    try {
-      values = evaluateJq(parseJq(filter), inputs);
-    } catch (e) {
-      return fail(ctx, `jq: ${(e && e.message) || e}`);
-    }
-    for (const value of values) {
-      if (value === undefined) ctx.stdout("null\n");
-      else if (raw && typeof value === "string") ctx.stdout(`${value}\n`);
-      else ctx.stdout(`${JSON.stringify(value, null, compact ? 0 : 2)}\n`);
-    }
-    if (exitStatus) return values.length && values.some((v) => v !== false && v !== null) ? 0 : 1;
-    return 0;
-  };
-
-  const jqTruthy = (v) => v !== false && v !== null && v !== undefined;
-  const jqLength = (v) => {
-    if (v == null) return 0;
-    if (typeof v === "number") return Math.abs(v);
-    if (typeof v === "string") return [...v].length;
-    return Object.keys(v).length;
-  };
-  const jqKeys = (v) => {
-    if (Array.isArray(v)) return v.map((_, i) => i);
-    if (v && typeof v === "object") return Object.keys(v).sort();
-    return [];
-  };
-  const jqType = (v) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
-  const jqEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-  const jqAdd = (a, b) => {
-    if (a == null) return b;
-    if (b == null) return a;
-    if (typeof a === "number" && typeof b === "number") return a + b;
-    if (typeof a === "string" && typeof b === "string") return a + b;
-    if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
-    if (typeof a === "object" && typeof b === "object") return { ...a, ...b };
-    if (typeof a === "string" || typeof b === "string") return String(a) + String(b);
-    return Number(a) + Number(b);
-  };
-  const jqSum = (v) => {
-    if (!Array.isArray(v)) return v ?? null;
-    if (!v.length) return null;
-    return v.reduce((acc, item) => (acc === null ? item : jqAdd(acc, item)), null);
-  };
-
-
-  const applyJqOp = (op, l, r) => {
-    if (op === "or") return jqTruthy(l) || jqTruthy(r);
-    if (op === "and") return jqTruthy(l) && jqTruthy(r);
-    switch (op) {
-      case "+": return jqAdd(l, r);
-      case "-": return Number(l) - Number(r);
-      case "*": return Number(l) * Number(r);
-      case "/": return Number(l) / Number(r);
-      case "%": return Number(l) % Number(r);
-      case "==": return jqEqual(l, r);
-      case "!=": return !jqEqual(l, r);
-      case "<": return l < r;
-      case "<=": return l <= r;
-      case ">": return l > r;
-      case ">=": return l >= r;
-    }
-    throw new Error(`unsupported operator: ${op}`);
-  };
-
-  const parseJq = (text) => {
-    let pos = 0;
-    const ws = () => {
-      while (pos < text.length && /\s/.test(text[pos])) pos++;
-    };
-    const peek = (s) => {
-      ws();
-      return text.startsWith(s, pos);
-    };
-    const eat = (s) => {
-      if (!peek(s)) throw new Error(`unsupported filter: ${text}`);
-      pos += s.length;
-    };
-    const tryEat = (s) => {
-      if (peek(s)) {
-        pos += s.length;
-        return true;
-      }
-      return false;
-    };
-    const keyword = (word) => {
-      ws();
-      const m = new RegExp(`^${word}\\b`).test(text.slice(pos));
-      if (m) pos += word.length;
-      return m;
-    };
-    const ident = () => {
-      ws();
-      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(pos));
-      if (!m) throw new Error(`unsupported filter: ${text}`);
-      pos += m[0].length;
-      return m[0];
-    };
-    const jqString = () => {
-      ws();
-      if (text[pos] !== '"') throw new Error(`unsupported filter: ${text}`);
-      let out = "";
-      pos++;
-      while (pos < text.length && text[pos] !== '"') {
-        if (text[pos] === "\\") {
-          const c = text[pos + 1];
-          out += c === "n" ? "\n" : c === "t" ? "\t" : c === "r" ? "\r" : c;
-          pos += 2;
-        } else {
-          out += text[pos++];
-        }
-      }
-      pos++;
-      return out;
-    };
-    const jqNumber = () => {
-      ws();
-      const m = /^\d+(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(pos));
-      if (!m) throw new Error(`unsupported filter: ${text}`);
-      pos += m[0].length;
-      return Number(m[0]);
-    };
-
-    const parsePipe = () => {
-      let left = parseComma();
-      while (tryEat("|")) left = { k: "pipe", left, right: parseComma() };
-      return left;
-    };
-    const parseComma = () => {
-      let left = parseAlt();
-      while (tryEat(",")) left = { k: "comma", left, right: parseAlt() };
-      return left;
-    };
-    const parseAlt = () => {
-      let left = parseOr();
-      while (tryEat("//")) left = { k: "alt", left, right: parseOr() };
-      return left;
-    };
-    const parseOr = () => {
-      let left = parseAnd();
-      while (keyword("or")) left = { k: "bin", op: "or", left, right: parseAnd() };
-      return left;
-    };
-    const parseAnd = () => {
-      let left = parseCompare();
-      while (keyword("and")) left = { k: "bin", op: "and", left, right: parseCompare() };
-      return left;
-    };
-    const parseCompare = () => {
-      const left = parseAdditive();
-      for (const op of ["==", "!=", "<=", ">=", "<", ">"]) {
-        if (peek(op)) {
-          pos += op.length;
-          return { k: "bin", op, left, right: parseAdditive() };
-        }
-      }
-      return left;
-    };
-    const parseAdditive = () => {
-      let left = parseMultiplicative();
-      for (;;) {
-        if (peek("+")) {
-          pos++;
-          left = { k: "bin", op: "+", left, right: parseMultiplicative() };
-        } else if (peek("-")) {
-          pos++;
-          left = { k: "bin", op: "-", left, right: parseMultiplicative() };
-        } else return left;
-      }
-    };
-    const parseMultiplicative = () => {
-      let left = parseUnary();
-      for (;;) {
-        if (peek("*")) {
-          pos++;
-          left = { k: "bin", op: "*", left, right: parseUnary() };
-        } else if (peek("/") && !peek("//")) {
-          pos++;
-          left = { k: "bin", op: "/", left, right: parseUnary() };
-        } else if (peek("%")) {
-          pos++;
-          left = { k: "bin", op: "%", left, right: parseUnary() };
-        } else return left;
-      }
-    };
-    const parseUnary = () => {
-      ws();
-      if (peek("-")) {
-        pos++;
-        return { k: "neg", value: parseUnary() };
-      }
-      if (keyword("not")) return { k: "not", value: parseUnary() };
-      return parsePostfix();
-    };
-    const parsePostfix = () => {
-      let node = parsePrimary();
-      for (;;) {
-        ws();
-        if (peek(".[") || (peek("[") && node.k !== "identity")) {
-          // index or iterate applied to the current node
-          node = { k: "pipe", left: node, right: parsePath("[") };
-        } else if (peek(".") && !peek("..")) {
-          node = { k: "pipe", left: node, right: parsePath(".") };
-        } else if (tryEat("?")) {
-          node = { k: "try", value: node };
-        } else return node;
-      }
-    };
-    const parsePath = (start) => {
-      const steps = [];
-      if (start === ".") {
-        pos++;
-        ws();
-        // `.[]` and `.[0]` start with a bracket, not a key
-        if (text[pos] !== "[") steps.push({ k: "key", value: parseSegment() });
-      }
-      for (;;) {
-        ws();
-        if (peek("[")) {
-          pos++;
-          ws();
-          if (peek("]")) {
-            pos++;
-            steps.push({ k: "iterate" });
-          } else if (text[pos] === '"') {
-            steps.push({ k: "index", value: jqString() });
-            eat("]");
-          } else {
-            const m = /^-?\d+/.exec(text.slice(pos));
-            if (!m) throw new Error(`unsupported filter: ${text}`);
-            pos += m[0].length;
-            steps.push({ k: "index", value: Number(m[0]) });
-            eat("]");
-          }
-          continue;
-        }
-        if (peek(".")) {
-          pos++;
-          steps.push({ k: "key", value: parseSegment() });
-          continue;
-        }
+      const value = () => {
+        const eq = a.indexOf("=");
+        return eq > 0 && a.startsWith("--") ? a.slice(eq + 1) : argv[++i];
+      };
+      if (a === "--") {
+        rest.push(...argv.slice(i + 1));
         break;
       }
-      return steps.length ? { k: "path", steps } : { k: "identity" };
-    };
-    const parseSegment = () => {
-      ws();
-      if (text[pos] === '"') return jqString();
-      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(pos));
-      if (!m) throw new Error(`unsupported filter: ${text}`);
-      pos += m[0].length;
-      return m[0];
-    };
-    const ZERO_ARG = new Set(["length", "keys", "type", "first", "last", "add", "tostring", "tonumber", "tojson", "fromjson", "ascii_downcase", "ascii_upcase", "empty", "now", "floor", "ceil", "round"]);
-    const ARG_FUNCS = new Set(["map", "select", "has", "split", "join", "any", "all", "contains", "startswith", "endswith", "ltrimstr", "rtrimstr"]);
-    const parsePrimary = () => {
-      ws();
-      if (text[pos] === "(") {
-        pos++;
-        const inner = parsePipe();
-        eat(")");
-        return inner;
-      }
-      if (text[pos] === "[") {
-        pos++;
-        ws();
-        if (text[pos] === "]") {
-          pos++;
-          return { k: "array", value: { k: "identity" } };
-        }
-        const inner = parsePipe();
-        eat("]");
-        return { k: "array", value: inner };
-      }
-      if (text[pos] === "{") {
-        pos++;
-        const entries = [];
-        ws();
-        if (text[pos] !== "}") {
-          for (;;) {
-            ws();
-            let key;
-            if (text[pos] === '"') key = jqString();
-            else key = ident();
-            ws();
-            if (tryEat(":")) entries.push([key, parseAlt()]);
-            else entries.push([key, { k: "path", steps: [{ k: "key", value: key }] }]);
-            if (tryEat(",")) continue;
-            break;
-          }
-        }
-        eat("}");
-        return { k: "object", entries };
-      }
-      if (text[pos] === ".") {
-        if (/^\.\s*[A-Za-z_"]/.test(text.slice(pos)) || /^\.\s*\[/.test(text.slice(pos))) return parsePath(".");
-        pos++;
-        return { k: "identity" };
-      }
-      if (text[pos] === "@") {
-        pos++;
-        const name = ident();
-        return { k: "format", name };
-      }
-      if (text[pos] === '"') return { k: "literal", value: jqString() };
-      if (/\d/.test(text[pos] ?? "")) return { k: "literal", value: jqNumber() };
-      if (keyword("true")) return { k: "literal", value: true };
-      if (keyword("false")) return { k: "literal", value: false };
-      if (keyword("null")) return { k: "literal", value: null };
-      if (/^[A-Za-z_]/.test(text[pos] ?? "")) {
-        const name = ident();
-        if (tryEat("(")) {
-          if (!ARG_FUNCS.has(name)) throw new Error(`unsupported function: ${name}`);
-          const args = [];
-          ws();
-          if (text[pos] !== ")") {
-            for (;;) {
-              args.push(parseAlt());
-              if (tryEat(",")) continue;
-              break;
-            }
-          }
-          eat(")");
-          return { k: "call", name, args };
-        }
-        if (!ZERO_ARG.has(name)) throw new Error(`unsupported filter: ${text}`);
-        return { k: "call", name, args: [] };
-      }
-      throw new Error(`unsupported filter: ${text}`);
-    };
-
-    const program = parsePipe();
-    ws();
-    if (pos < text.length) throw new Error(`unsupported filter: ${text}`);
-    return program;
-  };
-
-  const navigateJq = (input, steps) => {
-    let stream = [input];
-    for (const step of steps) {
-      const next = [];
-      for (const value of stream) {
-        if (step.k === "iterate") {
-          if (Array.isArray(value)) next.push(...value);
-          else if (value && typeof value === "object") next.push(...Object.values(value));
-        } else if (step.k === "index") {
-          if (Array.isArray(value)) {
-            const index = Number(step.value);
-            if (index >= 0 && index < value.length) next.push(value[index]);
-          } else if (value && typeof value === "object") {
-            if (step.value in value) next.push(value[step.value]);
-          } else if (value == null) next.push(null);
-        } else if (value == null) next.push(null);
-        else next.push(value[step.value] ?? null);
-      }
-      stream = next;
-    }
-    return stream;
-  };
-
-  const evaluateJq = (node, inputs) => {
-    switch (node.k) {
-      case "identity":
-        return inputs;
-      case "literal":
-        return inputs.map(() => node.value);
-      case "path": {
-        const out = [];
-        for (const input of inputs) out.push(...navigateJq(input, node.steps));
-        return out;
-      }
-      case "comma":
-        return [...evaluateJq(node.left, inputs), ...evaluateJq(node.right, inputs)];
-      case "pipe":
-        return evaluateJq(node.right, evaluateJq(node.left, inputs));
-      case "bin": {
-        const results = [];
-        for (const input of inputs) {
-          const left = evaluateJq(node.left, [input]);
-          const right = evaluateJq(node.right, [input]);
-          for (const l of left) {
-            for (const r of right) results.push(applyJqOp(node.op, l, r));
-          }
-        }
-        return results;
-      }
-      case "try":
-        try {
-          return evaluateJq(node.value, inputs);
-        } catch {
-          return [];
-        }
-      case "alt": {
-        const left = evaluateJq(node.left, inputs).filter(jqTruthy);
-        return left.length ? left : evaluateJq(node.right, inputs);
-      }
-      case "neg":
-        return evaluateJq(node.value, inputs).map((v) => -Number(v));
-      case "not":
-        return evaluateJq(node.value, inputs).map((v) => !jqTruthy(v));
-      case "array":
-        return [evaluateJq(node.value, inputs)];
-      case "object": {
-        const out = {};
-        for (const [key, value] of node.entries) out[key] = evaluateJq(value, inputs)[0] ?? null;
-        return [out];
-      }
-      case "format": {
-        const value = inputs[0];
-        if (node.name === "base64") return [btoa(typeof value === "string" ? value : JSON.stringify(value))];
-        if (node.name === "base64d") return [atob(String(value))];
-        if (node.name === "tsv") return [Array.isArray(value) ? value.map((v) => String(v ?? "")).join("\t") : String(value)];
-        if (node.name === "csv") return [Array.isArray(value) ? value.map((v) => (typeof v === "string" && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : String(v ?? ""))).join(",") : String(value)];
-        if (node.name === "json") return [JSON.stringify(value)];
-        throw new Error(`unsupported filter: @${node.name}`);
-      }
-      case "call": {
-        const first = inputs[0];
-        const arg = (i) => (node.args[i] ? evaluateJq(node.args[i], inputs) : []);
-        switch (node.name) {
-          case "length": return inputs.map(jqLength);
-          case "keys": return inputs.map(jqKeys);
-          case "type": return inputs.map(jqType);
-          case "first": return node.args.length ? evaluateJq(node.args[0], inputs).slice(0, 1) : [Array.isArray(first) ? first[0] : first];
-          case "last": return node.args.length ? evaluateJq(node.args[0], inputs).slice(-1) : [Array.isArray(first) ? first[first.length - 1] : first];
-          case "add": return inputs.map(jqSum);
-          case "tostring": return inputs.map((v) => (typeof v === "string" ? v : JSON.stringify(v)));
-          case "tonumber": return inputs.map((v) => Number(v));
-          case "tojson": return inputs.map((v) => JSON.stringify(v));
-          case "fromjson": return inputs.map((v) => JSON.parse(String(v)));
-          case "ascii_downcase": return inputs.map((v) => String(v).toLowerCase());
-          case "ascii_upcase": return inputs.map((v) => String(v).toUpperCase());
-          case "split": return inputs.map((v) => String(v).split(String(arg(0)[0] ?? "")));
-          case "join": return inputs.map((v) => (Array.isArray(v) ? v.map((x) => String(x ?? "")).join(String(arg(0)[0] ?? "")) : String(v)));
-          case "map": return [evaluateJq(node.args[0], Array.isArray(first) ? first : [first])];
-          case "select": {
-            const kept = [];
-            for (const input of inputs) if (evaluateJq(node.args[0], [input]).some(jqTruthy)) kept.push(input);
-            return kept;
-          }
-          case "has": {
-            const key = arg(0)[0];
-            if (Array.isArray(first)) return [typeof key === "number" && key >= 0 && key < first.length];
-            if (first && typeof first === "object") return [key in first];
-            return [false];
-          }
-          case "any": return [inputs.some((v) => (Array.isArray(v) ? v.some(jqTruthy) : jqTruthy(v)))];
-          case "all": return [inputs.every((v) => (Array.isArray(v) ? v.every(jqTruthy) : jqTruthy(v)))];
-          case "contains": return inputs.map((v) => JSON.stringify(v).includes(String(arg(0)[0])));
-          case "startswith": return inputs.map((v) => String(v).startsWith(String(arg(0)[0])));
-          case "endswith": return inputs.map((v) => String(v).endsWith(String(arg(0)[0])));
-          case "ltrimstr": return inputs.map((v) => (typeof v === "string" && v.startsWith(String(arg(0)[0])) ? v.slice(String(arg(0)[0]).length) : v));
-          case "rtrimstr": return inputs.map((v) => (typeof v === "string" && v.endsWith(String(arg(0)[0])) ? v.slice(0, -String(arg(0)[0]).length) : v));
-          case "floor": return inputs.map((v) => Math.floor(Number(v)));
-          case "ceil": return inputs.map((v) => Math.ceil(Number(v)));
-          case "round": return inputs.map((v) => Math.round(Number(v)));
-          case "empty": return [];
-          case "now": return [Date.now() / 1000];
-          default: throw new Error(`unsupported function: ${node.name}`);
-        }
-      }
-      default:
-        throw new Error("unsupported filter");
-    }
-  };
-
-  // ------------------------------------------------------------ diff and cmp
-  const diff = (ctx) => {
-    const argv = argsOf(ctx);
-    const quiet = argv.includes("-q");
-    const files = argv.filter((a) => !a.startsWith("-"));
-    if (files.length !== 2) return fail(ctx, "diff: need two files");
-    const a = decoder.decode(read(ctx, files[0])).split("\n");
-    const b = decoder.decode(read(ctx, files[1])).split("\n");
-    const same = a.length === b.length && a.every((line, i) => line === b[i]);
-    if (same) return 0;
-    if (quiet) {
-      ctx.stdout(`Files ${files[0]} and ${files[1]} differ\n`);
-      return 1;
-    }
-    if (a.length > 1500 || b.length > 1500) {
-      ctx.stdout(`Files ${files[0]} and ${files[1]} differ (too large for a line diff)\n`);
-      return 1;
-    }
-    const ops = diffOps(a, b);
-    ctx.stdout(`--- ${files[0]}\n+++ ${files[1]}\n`);
-    ctx.stdout(`@@ -1,${a.length} +1,${b.length} @@\n`);
-    for (const op of ops) ctx.stdout(`${op.prefix}${op.line}\n`);
-    return 1;
-  };
-  const diffOps = (a, b) => {
-    const n = a.length;
-    const m = b.length;
-    const width = m + 1;
-    const lcs = new Int32Array((n + 1) * width);
-    for (let i = n - 1; i >= 0; i--) {
-      for (let j = m - 1; j >= 0; j--) {
-        lcs[i * width + j] = a[i] === b[j] ? lcs[(i + 1) * width + j + 1] + 1 : Math.max(lcs[(i + 1) * width + j], lcs[i * width + j + 1]);
-      }
-    }
-    const ops = [];
-    let i = 0;
-    let j = 0;
-    while (i < n && j < m) {
-      if (a[i] === b[j]) {
-        ops.push({ prefix: " ", line: a[i++] });
-        j++;
-      } else if (lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) {
-        ops.push({ prefix: "-", line: a[i++] });
-      } else {
-        ops.push({ prefix: "+", line: b[j++] });
-      }
-    }
-    while (i < n) ops.push({ prefix: "-", line: a[i++] });
-    while (j < m) ops.push({ prefix: "+", line: b[j++] });
-    return ops;
-  };
-  const cmp = (ctx) => {
-    const files = argsOf(ctx).filter((a) => !a.startsWith("-"));
-    if (files.length !== 2) return fail(ctx, "cmp: need two files");
-    const a = read(ctx, files[0]);
-    const b = read(ctx, files[1]);
-    const len = Math.min(a.length, b.length);
-    for (let i = 0; i < len; i++) {
-      if (a[i] !== b[i]) {
-        ctx.stdout(`${files[0]} ${files[1]} differ: byte ${i + 1}, line 1\n`);
-        return 1;
-      }
-    }
-    if (a.length !== b.length) {
-      ctx.stdout(`cmp: EOF on ${a.length < b.length ? files[0] : files[1]} after byte ${len}\n`);
-      return 1;
-    }
-    return 0;
-  };
-
-  // --------------------------------------------------------------- fflate IO
-  const gzip = (ctx) => {
-    const argv = argsOf(ctx);
-    const toStdout = argv.includes("-c");
-    const keep = argv.includes("-k");
-    const files = argv.filter((a) => !a.startsWith("-"));
-    if (!files.length) {
-      ctx.stdout(gzipSync(stdinBytes(ctx)));
-      return 0;
-    }
-    for (const name of files) {
-      const path = resolve(ctx, name);
-      const bytes = gzipSync(read(ctx, name));
-      if (toStdout) ctx.stdout(bytes);
-      else {
-        write(`${path}.gz`, bytes);
-        if (!keep) {
-          try {
-            store.unlinkSync(path);
-          } catch {
-            /* nothing */
-          }
-        }
-      }
-    }
-    return 0;
-  };
-  const gunzip = (ctx, forceStdout = false) => {
-    const argv = argsOf(ctx);
-    const toStdout = forceStdout || argv.includes("-c");
-    const keep = argv.includes("-k");
-    const files = argv.filter((a) => !a.startsWith("-"));
-    if (!files.length) {
-      try {
-        ctx.stdout(gunzipSync(stdinBytes(ctx)));
-      } catch {
-        return fail(ctx, "gunzip: invalid gzip data");
-      }
-      return 0;
-    }
-    for (const name of files) {
-      const path = resolve(ctx, name);
-      let bytes;
-      try {
-        bytes = gunzipSync(read(ctx, name));
-      } catch {
-        return fail(ctx, `gunzip: ${name}: not in gzip format`);
-      }
-      if (toStdout) ctx.stdout(bytes);
-      else {
-        const out = path.endsWith(".gz") ? path.slice(0, -3) : `${path}.out`;
-        write(out, bytes);
-        if (!keep) {
-          try {
-            store.unlinkSync(path);
-          } catch {
-            /* nothing */
-          }
-        }
-      }
-    }
-    return 0;
-  };
-  const zcat = (ctx) => gunzip(ctx, true);
-
-  const tar = (ctx) => {
-    const argv = argsOf(ctx);
-    const flags = argv.find((a) => /^[a-z-]+$/.test(a) && !a.startsWith("--") && /[cxt]/.test(a)) ?? argv[0] ?? "";
-    const mode = flags.includes("c") ? "c" : flags.includes("x") ? "x" : flags.includes("t") ? "t" : "";
-    const gz = flags.includes("z") || argv.some((a) => a.endsWith(".gz") || a.endsWith(".tgz"));
-    const files = [];
-    let dir = null;
-    let flagsToken = null;
-    for (let i = 0; i < argv.length; i++) {
-      const a = argv[i];
-      if (a === "-C") dir = resolve(ctx, argv[++i] ?? ".");
-      else if (a === "-f") continue;
-      else if (/^[a-z-]*[cxt][a-z-]*$/.test(a) && !a.startsWith("--")) flagsToken = a;
-      else if (a.startsWith("-") && /^[a-z-]+$/.test(a.slice(1))) continue;
-      else files.push(a);
-    }
-    if (!mode) return fail(ctx, "tar: specify one of -c, -x or -t");
-    const tarPath = files.shift();
-    const base = dir ?? cwdOf(ctx);
-    if (mode === "c") {
-      if (!tarPath) return fail(ctx, "tar: missing archive name");
-      const entries = [];
-      for (const f of files.length ? files : ["."]) {
-        const abs = dir ? norm(`${dir}/${f}`) : resolve(ctx, f);
-        if (isDir(abs)) {
-          for (const p of walk(abs)) {
-            entries.push({ name: relTo(base, p), bytes: snapshot()[p] });
-          }
-        } else {
-          entries.push({ name: relTo(base, abs), bytes: snapshot()[abs] });
-        }
-      }
-      let out = tarCreate(entries);
-      if (gz) out = gzipSync(out);
-      write(resolve(ctx, tarPath), out);
-      return 0;
-    }
-    let data;
-    try {
-      data = read(ctx, tarPath);
-    } catch (e) {
-      return fail(ctx, `tar: ${e.message}`);
-    }
-    if (gz || (data[0] === 0x1f && data[1] === 0x8b)) data = gunzipSync(data);
-    const entries = tarRead(data);
-    if (mode === "t") {
-      for (const e of entries) ctx.stdout(`${e.name}\n`);
-      return 0;
-    }
-    for (const entry of entries) {
-      const path = norm(`${base}/${entry.name}`);
-      if (entry.dir) mkdirp(path);
-      else {
-        mkdirp(path);
-        write(path, entry.bytes);
-      }
-    }
-    return 0;
-  };
-  const relTo = (base, path) => norm(path).replace(new RegExp(`^${base.replace(/\/$/, "")}/?`), "").replace(/^\//, "") || ".";
-  const tarCreate = (entries) => {
-    const blocks = [];
-    for (const entry of entries) {
-      const name = entry.name.endsWith("/") ? entry.name : entry.name;
-      const size = entry.bytes?.length ?? 0;
-      const header = new Uint8Array(512);
-      const put = (offset, length, text) => {
-        const bytes = encoder.encode(text);
-        header.set(bytes.subarray(0, length), offset);
-      };
-      const octal = (value, length) => value.toString(8).padStart(length - 1, "0") + "\0";
-      put(0, 100, name.length > 100 ? name.slice(-100) : name);
-      put(100, 8, octal(0o644, 8));
-      put(108, 8, octal(0, 8));
-      put(116, 8, octal(0, 8));
-      put(124, 12, octal(size, 12));
-      put(136, 12, octal(Math.floor(Date.now() / 1000), 12));
-      header.fill(0x20, 148, 156);
-      header[156] = 0x30;
-      put(257, 6, "ustar\0");
-      put(263, 2, "00");
-      let sum = 0;
-      for (const byte of header) sum += byte;
-      put(148, 8, `${sum.toString(8).padStart(6, "0")}\0 `);
-      blocks.push(header);
-      if (entry.bytes?.length) {
-        blocks.push(entry.bytes);
-        const pad = (512 - (entry.bytes.length % 512)) % 512;
-        if (pad) blocks.push(new Uint8Array(pad));
-      }
-    }
-    blocks.push(new Uint8Array(1024));
-    const total = blocks.reduce((n, b) => n + b.length, 0);
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const b of blocks) {
-      out.set(b, off);
-      off += b.length;
-    }
-    return out;
-  };
-  const tarRead = (data) => {
-    const entries = [];
-    let off = 0;
-    while (off + 512 <= data.length) {
-      const header = data.subarray(off, off + 512);
-      if (header.every((b) => b === 0)) break;
-      const text = (start, length) => decoder.decode(header.subarray(start, start + length)).replace(/\0.*$/, "").trim();
-      const name = text(0, 100) + (text(345, 155) ? `/${text(345, 155)}` : "");
-      const size = Number.parseInt(text(124, 12) || "0", 8);
-      const type = String.fromCharCode(header[156] || 0x30);
-      off += 512;
-      if (type === "5") {
-        entries.push({ name: name.replace(/\/$/, "") + "/", dir: true });
+      if (!a.startsWith("-") || a === "-") {
+        rest.push(a);
         continue;
       }
-      entries.push({ name, bytes: data.subarray(off, off + size) });
-      off += Math.ceil(size / 512) * 512;
+      const long = a.split("=")[0];
+      switch (long) {
+        case "-i":
+        case "--ignore-case":
+          o.i = true;
+          break;
+        case "-S":
+        case "--smart-case":
+          o.smart = true;
+          break;
+        case "-s":
+        case "--case-sensitive":
+          o.i = false;
+          o.smart = false;
+          break;
+        case "-F":
+        case "--fixed-strings":
+          o.F = true;
+          break;
+        case "-w":
+        case "--word-regexp":
+          o.w = true;
+          break;
+        case "-x":
+        case "--line-regexp":
+          o.x = true;
+          break;
+        case "-v":
+        case "--invert-match":
+          o.v = true;
+          break;
+        case "-n":
+        case "--line-number":
+          o.n = true;
+          break;
+        case "-N":
+        case "--no-line-number":
+          o.n = false;
+          break;
+        case "-l":
+        case "--files-with-matches":
+          o.l = true;
+          break;
+        case "--files-without-match":
+          o.L = true;
+          break;
+        case "-c":
+        case "--count":
+        case "--count-matches":
+          o.c = true;
+          break;
+        case "-o":
+        case "--only-matching":
+          o.o = true;
+          break;
+        case "-q":
+        case "--quiet":
+          o.q = true;
+          break;
+        case "--files":
+          o.files = true;
+          break;
+        case "--hidden":
+          o.hidden = true;
+          break;
+        case "--no-ignore":
+        case "--no-ignore-vcs":
+          o.ignore = false;
+          break;
+        case "-u":
+          o.ignore = false;
+          break;
+        case "-uu":
+        case "-uuu":
+          o.ignore = false;
+          o.hidden = true;
+          break;
+        case "-A":
+        case "--after-context":
+          o.after = Number(value());
+          break;
+        case "-B":
+        case "--before-context":
+          o.before = Number(value());
+          break;
+        case "-C":
+        case "--context":
+          o.before = o.after = Number(value());
+          break;
+        case "-m":
+        case "--max-count":
+          o.max = Number(value());
+          break;
+        case "-d":
+        case "--max-depth":
+        case "--maxdepth":
+          o.maxDepth = Number(value());
+          break;
+        case "-e":
+        case "--regexp":
+          patterns.push(value());
+          break;
+        case "-g":
+        case "--glob":
+        case "--iglob":
+          o.globs.push(value());
+          break;
+        case "-t":
+        case "--type":
+          o.onlyType.push(value());
+          break;
+        case "-T":
+        case "--type-not":
+          o.notType.push(value());
+          break;
+        case "-H":
+        case "--with-filename":
+          o.filename = true;
+          break;
+        case "-I":
+        case "--no-filename":
+          o.filename = false;
+          break;
+        case "--heading":
+          o.heading = true;
+          break;
+        default:
+          if (/^-[A-Za-z]{2,}$/.test(a)) {
+            // clustered short flags: -in, -il, -nw
+            argv.splice(i + 1, 0, ...a.slice(1).split("").map((c) => `-${c}`));
+          }
+        // --no-heading, --color, --sort, --trim, -z, -U, -j: accepted, no effect here
+      }
     }
-    return entries;
+    if (!patterns.length && !o.files) {
+      if (!rest.length) return ctx.fail("rg: no pattern given", 2);
+      patterns.push(rest.shift());
+    }
+    const paths = rest.length ? rest : ["."];
+    let flags = "";
+    if (o.i || (o.smart && !patterns.some((p) => /[A-Z]/.test(p)))) flags += "i";
+    let re;
+    try {
+      const sources = patterns.map((p) => {
+        let s = p;
+        const inline = /^\(\?([a-z]+)\)/.exec(s);
+        if (inline) {
+          if (inline[1].includes("i")) flags += flags.includes("i") ? "" : "i";
+          s = s.slice(inline[0].length);
+        }
+        return o.F ? s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : s;
+      });
+      let source = sources.join("|");
+      if (o.w) source = `\\b(?:${source})\\b`;
+      if (o.x) source = `^(?:${source})$`;
+      re = new RegExp(source, `${flags}g`);
+    } catch (error) {
+      return ctx.fail(`rg: regex parse error: ${error.message}`, 2);
+    }
+    const typeExts = (names) => names.flatMap((t) => RG_TYPES[t] ?? [t]);
+    const onlyExts = typeExts(o.onlyType);
+    const notExts = typeExts(o.notType);
+    const include = o.globs.filter((g) => !g.startsWith("!")).map((g) => globRe(g, g.includes("/")));
+    const exclude = o.globs.filter((g) => g.startsWith("!")).map((g) => globRe(g.slice(1), g.includes("/")));
+    const wanted = (file, rel) => {
+      const name = file.slice(file.lastIndexOf("/") + 1);
+      const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+      if (onlyExts.length && !onlyExts.includes(ext)) return false;
+      if (notExts.includes(ext)) return false;
+      if (include.length && !include.some((g) => g.test(rel) || g.test(name))) return false;
+      if (exclude.some((g) => g.test(rel) || g.test(name))) return false;
+      return true;
+    };
+    const targets = [];
+    for (const p of paths) {
+      const abs = ctx.resolve(p);
+      if (!exists(abs)) {
+        ctx.stderr(encoder.encode(`rg: ${p}: No such file or directory (os error 2)\n`));
+        continue;
+      }
+      if (!isDir(abs)) {
+        targets.push([abs, p, true]);
+        continue;
+      }
+      for (const file of walkFiles(abs, { hidden: o.hidden, ignore: o.ignore, maxDepth: o.maxDepth })) {
+        const rel = file.slice(abs.length + 1);
+        if (wanted(file, rel)) targets.push([file, p, false]);
+      }
+    }
+    const showName = o.filename ?? !(targets.length === 1 && targets[0][2]);
+    let matched = false;
+    const out = [];
+    const flush = () => {
+      if (out.length) ctx.print(out.splice(0).join(""));
+    };
+    for (const [file, arg, explicit] of targets) {
+      const bytes = store.readFile(file);
+      if (!bytes) continue;
+      if (!explicit && bytes.subarray(0, 8192).includes(0)) continue;
+      const name = display(ctx, file, arg.startsWith("/") ? arg : null).replace(/^\.\//, "");
+      if (o.files) {
+        out.push(`${name}\n`);
+        continue;
+      }
+      const lines = decoder.decode(bytes).split("\n");
+      if (lines[lines.length - 1] === "") lines.pop();
+      let hits = 0;
+      let lastPrinted = -1;
+      const pending = [];
+      const prefix = (n, sep) => `${showName && !o.heading ? `${name}${sep}` : ""}${o.n ? `${n + 1}${sep}` : ""}`;
+      for (let n = 0; n < lines.length && hits < o.max; n++) {
+        re.lastIndex = 0;
+        const line = lines[n];
+        const found = re.test(line);
+        if (found === o.v) continue;
+        hits++;
+        matched = true;
+        if (o.q) return 0;
+        if (o.l || o.L || o.c) continue;
+        if (o.heading && hits === 1) pending.push(`${name}\n`);
+        if (o.before || o.after) {
+          const from = Math.max(lastPrinted + 1, n - o.before);
+          if (lastPrinted >= 0 && from > lastPrinted + 1) pending.push("--\n");
+          for (let k = from; k < n; k++) pending.push(`${prefix(k, "-")}${lines[k]}\n`);
+        }
+        if (o.o && !o.v) {
+          re.lastIndex = 0;
+          for (const m of line.matchAll(re)) pending.push(`${prefix(n, ":")}${m[0]}\n`);
+        } else pending.push(`${prefix(n, ":")}${line}\n`);
+        lastPrinted = n;
+        if (o.after) {
+          let k = n + 1;
+          for (; k < lines.length && k <= n + o.after; k++) {
+            re.lastIndex = 0;
+            if (re.test(lines[k]) !== o.v) break;
+            pending.push(`${prefix(k, "-")}${lines[k]}\n`);
+            lastPrinted = k;
+          }
+        }
+      }
+      if (o.l && hits) out.push(`${name}\n`);
+      else if (o.L && !hits) out.push(`${name}\n`);
+      else if (o.c && hits) out.push(showName ? `${name}:${hits}\n` : `${hits}\n`);
+      else if (pending.length) {
+        out.push(...pending);
+        if (o.heading) out.push("\n");
+      }
+      if (out.length > 512) flush();
+    }
+    flush();
+    if (o.L) return 0;
+    return matched || o.files ? 0 : 1;
+  };
+
+  // ---------------------------------------------------------------- fd
+  const fd = (ctx) => {
+    const argv = ctx.args;
+    const o = { type: null, exts: [], hidden: false, ignore: true, maxDepth: Infinity, absolute: false, glob: false, fullPath: false, exclude: [], exec: null, execBatch: null, caseSensitive: null };
+    const rest = [];
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === "-t" || a === "--type") o.type = argv[++i];
+      else if (a.startsWith("--type=")) o.type = a.slice(7);
+      else if (a === "-e" || a === "--extension") o.exts.push(String(argv[++i]).replace(/^\./, ""));
+      else if (a.startsWith("--extension=")) o.exts.push(a.slice(12).replace(/^\./, ""));
+      else if (a === "-H" || a === "--hidden") o.hidden = true;
+      else if (a === "-I" || a === "--no-ignore") o.ignore = false;
+      else if (a === "-u" || a === "--unrestricted") {
+        o.hidden = true;
+        o.ignore = false;
+      } else if (a === "-d" || a === "--max-depth" || a === "--maxdepth") o.maxDepth = Number(argv[++i]);
+      else if (a.startsWith("--max-depth=")) o.maxDepth = Number(a.slice(12));
+      else if (a === "-a" || a === "--absolute-path") o.absolute = true;
+      else if (a === "-g" || a === "--glob") o.glob = true;
+      else if (a === "-p" || a === "--full-path") o.fullPath = true;
+      else if (a === "-E" || a === "--exclude") o.exclude.push(globRe(argv[++i], false));
+      else if (a === "-s" || a === "--case-sensitive") o.caseSensitive = true;
+      else if (a === "-i" || a === "--ignore-case") o.caseSensitive = false;
+      else if (a === "-x" || a === "--exec" || a === "-X" || a === "--exec-batch") {
+        const cmd = [];
+        for (i++; i < argv.length && argv[i] !== ";"; i++) cmd.push(argv[i]);
+        if (a === "-x" || a === "--exec") o.exec = cmd;
+        else o.execBatch = cmd;
+      } else if (a.startsWith("-")) continue;
+      else rest.push(a);
+    }
+    const pattern = rest[0] ?? "";
+    const roots = rest.length > 1 ? rest.slice(1) : ["."];
+    let re = null;
+    if (pattern) {
+      const insensitive = o.caseSensitive === false || (o.caseSensitive === null && !/[A-Z]/.test(pattern));
+      try {
+        re = o.glob ? globRe(pattern, o.fullPath, insensitive) : new RegExp(pattern, insensitive ? "i" : "");
+      } catch (error) {
+        return ctx.fail(`fd: invalid pattern: ${error.message}`, 1);
+      }
+    }
+    const found = [];
+    for (const r of roots) {
+      const abs = ctx.resolve(r);
+      if (!isDir(abs)) return ctx.fail(`[fd error]: '${r}' is not a directory.`, 1);
+      for (const path of walkFiles(abs, { hidden: o.hidden, ignore: o.ignore, maxDepth: o.maxDepth, dirs: o.type !== "f" && o.type !== "file" })) {
+        const dir = isDir(path);
+        if ((o.type === "f" || o.type === "file") && dir) continue;
+        if ((o.type === "d" || o.type === "directory") && !dir) continue;
+        const name = path.slice(path.lastIndexOf("/") + 1);
+        if (o.exts.length && !o.exts.some((e) => name.endsWith(`.${e}`))) continue;
+        if (o.exclude.some((g) => g.test(name))) continue;
+        if (re && !re.test(o.fullPath ? path : name)) continue;
+        const shown = o.absolute ? path : r === "." ? path.slice(ctx.cwd.replace(/\/$/, "").length + 1) : `${r.replace(/\/$/, "")}/${path.slice(abs.length + 1)}`;
+        found.push(dir ? `${shown}/` : shown);
+      }
+    }
+    if (o.exec || o.execBatch) {
+      let code = 0;
+      const sub = (cmd, file) => cmd.map((c) => c.replace(/\{\}/g, file).replace(/\{\/\}/g, file.split("/").pop()).replace(/\{\.\}/g, file.replace(/\.[^./]*$/, "")));
+      const run = (argv2) => shell.spawn(argv2, { cwd: ctx.cwd, env: ctx.env, stdin: () => new Uint8Array(0), stdout: ctx.stdout, stderr: ctx.stderr });
+      if (o.exec) for (const f of found) code = run(o.exec.some((c) => c.includes("{")) ? sub(o.exec, f.replace(/\/$/, "")) : [...o.exec, f.replace(/\/$/, "")]) || code;
+      else code = run([...o.execBatch.filter((c) => c !== "{}"), ...found.map((f) => f.replace(/\/$/, ""))]);
+      return code;
+    }
+    if (found.length) ctx.print(`${found.join("\n")}\n`);
+    return 0;
+  };
+
+  // ----------------------------------------------------------- archives
+  const gzipTool = (mode) => (ctx) => {
+    const argv = ctx.args;
+    const flags = argv.filter((a) => a.startsWith("-") && a !== "-").join("");
+    const decompress = mode === "gunzip" || mode === "zcat" || flags.includes("d");
+    const toStdout = mode === "zcat" || flags.includes("c");
+    const keep = flags.includes("k");
+    const level = Number((/[1-9]/.exec(flags) ?? ["6"])[0]);
+    const files = argv.filter((a) => !a.startsWith("-") || a === "-");
+    const transform = (bytes, name) => {
+      if (!decompress) return gzipSync(bytes, { level });
+      try {
+        return gunzipSync(bytes);
+      } catch {
+        throw new Error(`${name}: not in gzip format`);
+      }
+    };
+    if (!files.length || files[0] === "-") {
+      ctx.stdout(transform(ctx.readAll(), "stdin"));
+      return 0;
+    }
+    for (const name of files) {
+      const path = ctx.resolve(name);
+      const out = transform(readFile(ctx, name), name);
+      if (toStdout) ctx.stdout(out);
+      else {
+        const target = decompress ? (path.endsWith(".gz") ? path.slice(0, -3) : path.endsWith(".tgz") ? `${path.slice(0, -4)}.tar` : `${path}.out`) : `${path}.gz`;
+        writeFile(target, out);
+        if (!keep) store.remove(path);
+      }
+    }
+    return 0;
+  };
+
+  const tar = (ctx) => {
+    const argv = ctx.args.slice();
+    let mode = "";
+    let gz = false;
+    let verbose = false;
+    let archive = null;
+    let dir = null;
+    let toStdout = false;
+    let strip = 0;
+    const excludes = [];
+    const names = [];
+    // the first word may be a bare flag cluster: `tar czf out.tgz dir`
+    if (argv[0] && !argv[0].startsWith("-") && /^[a-zA-Z]+$/.test(argv[0])) argv[0] = `-${argv[0]}`;
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a.startsWith("--")) {
+        const [key, val] = a.split(/=(.*)/);
+        if (key === "--file") archive = val ?? argv[++i];
+        else if (key === "--directory") dir = val ?? argv[++i];
+        else if (key === "--strip-components") strip = Number(val ?? argv[++i]);
+        else if (key === "--exclude") excludes.push(globRe(val ?? argv[++i], false));
+        else if (key === "--gzip" || key === "--gunzip") gz = true;
+        else if (key === "--extract" || key === "--get") mode = "x";
+        else if (key === "--create") mode = "c";
+        else if (key === "--list") mode = "t";
+        else if (key === "--to-stdout") toStdout = true;
+        else if (key === "--verbose") verbose = true;
+        continue;
+      }
+      if (a.startsWith("-") && a.length > 1) {
+        const letters = a.slice(1);
+        for (let k = 0; k < letters.length; k++) {
+          const c = letters[k];
+          if ("cxt".includes(c)) mode = c;
+          else if (c === "z") gz = true;
+          else if (c === "v") verbose = true;
+          else if (c === "O") toStdout = true;
+          else if (c === "f") {
+            archive = letters.slice(k + 1) || argv[++i];
+            break;
+          } else if (c === "C") {
+            dir = letters.slice(k + 1) || argv[++i];
+            break;
+          } else if (c === "j" || c === "J") return ctx.fail("tar: bzip2 and xz archives are not supported here; gzip is", 2);
+        }
+        continue;
+      }
+      names.push(a);
+    }
+    if (!mode) return ctx.fail("tar: You must specify one of the '-ctx' options", 2);
+    const base = dir ? ctx.resolve(dir) : ctx.cwd;
+    if (mode === "c") {
+      const entries = [];
+      for (const name of names.length ? names : ["."]) {
+        const abs = dir ? `${base.replace(/\/$/, "")}/${name}`.replace(/\/\.$/, "") : ctx.resolve(name);
+        if (!exists(abs)) return ctx.fail(`tar: ${name}: Cannot stat: No such file or directory`, 2);
+        const rel = (p) => {
+          const b = base.replace(/\/$/, "");
+          return p.startsWith(`${b}/`) ? p.slice(b.length + 1) : p.replace(/^\//, "");
+        };
+        if (isDir(abs)) {
+          entries.push({ name: `${rel(abs) || "."}/`, dir: true });
+          for (const d of store.walkDirs(abs)) entries.push({ name: `${rel(d)}/`, dir: true });
+          for (const f of store.walk(abs)) entries.push({ name: rel(f), bytes: store.readFile(f), mode: store.statSync(f).mode & 0o777 });
+        } else entries.push({ name: rel(abs), bytes: store.readFile(abs), mode: store.statSync(abs).mode & 0o777 });
+      }
+      const kept = entries.filter((e) => !excludes.some((g) => g.test(e.name.replace(/\/$/, "").split("/").pop()) || g.test(e.name.replace(/\/$/, ""))));
+      if (verbose) ctx.stderr(encoder.encode(kept.map((e) => `${e.name}\n`).join("")));
+      let out = tarCreate(kept);
+      if (gz || /\.(tgz|tar\.gz)$/.test(archive ?? "")) out = gzipSync(out);
+      if (!archive || archive === "-") ctx.stdout(out);
+      else writeFile(ctx.resolve(archive), out);
+      return 0;
+    }
+    let data = !archive || archive === "-" ? ctx.readAll() : readFile(ctx, archive);
+    if (data[0] === 0x1f && data[1] === 0x8b) data = gunzipSync(data);
+    let entries;
+    try {
+      entries = tarRead(data);
+    } catch (error) {
+      return ctx.fail(`tar: ${error.message}`, 2);
+    }
+    const pick = (name) => !names.length || names.some((n) => name === n || name.startsWith(`${n.replace(/\/$/, "")}/`));
+    for (const e of entries) {
+      if (!pick(e.name) || excludes.some((g) => g.test(e.name.split("/").pop()))) continue;
+      if (mode === "t") {
+        ctx.print(`${e.name}${e.dir && !e.name.endsWith("/") ? "/" : ""}\n`);
+        continue;
+      }
+      const parts = e.name.split("/").filter((p) => p && p !== ".");
+      if (parts.some((p) => p === "..")) {
+        ctx.stderr(encoder.encode(`tar: ${e.name}: skipping a path that leaves the target directory\n`));
+        continue;
+      }
+      const stripped = parts.slice(strip);
+      if (!stripped.length) continue;
+      if (verbose) ctx.stderr(encoder.encode(`${e.name}\n`));
+      if (toStdout) {
+        if (!e.dir && e.bytes) ctx.stdout(e.bytes);
+        continue;
+      }
+      const target = `${base.replace(/\/$/, "")}/${stripped.join("/")}`;
+      if (e.dir) store.mkdirp(target);
+      else if (e.bytes) {
+        writeFile(target, e.bytes.slice());
+        if (e.mode) store.touchSync(target, { mode: e.mode });
+      }
+    }
+    return 0;
   };
 
   const zip = (ctx) => {
-    const argv = argsOf(ctx);
-    const recursive = argv.includes("-r");
-    const files = argv.filter((a) => !a.startsWith("-"));
-    const archive = files.shift();
-    if (!archive) return fail(ctx, "zip: missing archive name");
+    const argv = ctx.args;
+    const recursive = argv.some((a) => /^-[a-zA-Z]*r/.test(a));
+    const junk = argv.some((a) => /^-[a-zA-Z]*j/.test(a));
+    const quiet = argv.some((a) => /^-[a-zA-Z]*q/.test(a));
+    const x = argv.indexOf("-x");
+    const excludes = x >= 0 ? argv.slice(x + 1).map((g) => globRe(g, g.includes("/"))) : [];
+    const words = (x >= 0 ? argv.slice(0, x) : argv).filter((a) => !a.startsWith("-"));
+    const archive = words.shift();
+    if (!archive) return ctx.fail("zip: missing archive name", 16);
+    const target = ctx.resolve(archive.endsWith(".zip") || archive.includes(".") ? archive : `${archive}.zip`);
     const tree = {};
-    for (const f of files) {
-      const abs = resolve(ctx, f);
+    const base = ctx.cwd.replace(/\/$/, "");
+    const add = (file) => {
+      const name = junk ? file.split("/").pop() : file.startsWith(`${base}/`) ? file.slice(base.length + 1) : file.replace(/^\//, "");
+      if (excludes.some((g) => g.test(name))) return;
+      tree[name] = store.readFile(file).slice();
+      if (!quiet) ctx.print(`  adding: ${name}\n`);
+    };
+    for (const w of words) {
+      const abs = ctx.resolve(w);
+      if (!exists(abs)) return ctx.fail(`zip warning: name not matched: ${w}`, 12);
       if (isDir(abs)) {
-        for (const p of walk(abs)) tree[relTo(cwdOf(ctx), p)] = snapshot()[p];
-      } else {
-        tree[relTo(cwdOf(ctx), abs)] = snapshot()[abs];
-      }
+        if (!recursive) continue;
+        for (const f of store.walk(abs)) add(f);
+      } else add(abs);
     }
-    if (!recursive && !Object.keys(tree).length) return fail(ctx, "zip: nothing to do");
-    write(resolve(ctx, archive), zipSync(tree, { level: 6 }));
+    if (!Object.keys(tree).length) return ctx.fail("zip error: Nothing to do!", 12);
+    writeFile(target, zipSync(tree, { level: 6 }));
     return 0;
   };
+
   const unzip = (ctx) => {
-    const argv = argsOf(ctx).filter((a) => a !== "-o" && a !== "-q");
-    const archive = argv[0];
-    if (!archive) return fail(ctx, "unzip: missing archive name");
+    const argv = ctx.args;
+    const list = argv.includes("-l");
+    const pipe = argv.includes("-p");
+    const quiet = argv.some((a) => /^-[a-zA-Z]*q/.test(a));
+    const d = argv.indexOf("-d");
+    const words = argv.filter((a, i) => !a.startsWith("-") && i !== d + 1);
+    const archive = words.shift();
+    if (!archive) return ctx.fail("unzip: missing archive name", 10);
     let entries;
     try {
-      entries = unzipSync(read(ctx, archive));
-    } catch {
-      return fail(ctx, `unzip: ${archive}: not a zip archive`);
+      entries = unzipSync(readFile(ctx, archive));
+    } catch (error) {
+      return ctx.fail(`unzip: cannot find or open ${archive}: ${error.message}`, 9);
     }
-    const base = argv[1] ? resolve(ctx, argv[1]) : cwdOf(ctx);
+    const base = d >= 0 ? ctx.resolve(argv[d + 1]) : ctx.cwd;
+    const pick = (name) => !words.length || words.some((w) => name === w || globRe(w, true).test(name));
+    if (list) {
+      let total = 0;
+      ctx.print("  Length      Name\n---------  ----\n");
+      for (const [name, bytes] of Object.entries(entries)) {
+        if (!pick(name)) continue;
+        total += bytes.length;
+        ctx.print(`${String(bytes.length).padStart(9)}  ${name}\n`);
+      }
+      ctx.print(`---------  ----\n${String(total).padStart(9)}  ${Object.keys(entries).length} files\n`);
+      return 0;
+    }
+    if (!quiet && !pipe) ctx.print(`Archive:  ${archive}\n`);
     for (const [name, bytes] of Object.entries(entries)) {
-      const path = norm(`${base}/${name}`);
-      if (name.endsWith("/")) mkdirp(path);
+      if (!pick(name)) continue;
+      if (name.split("/").some((p) => p === "..") || name.startsWith("/")) {
+        ctx.stderr(encoder.encode(`unzip: skipping ${name}: it leaves the target directory\n`));
+        continue;
+      }
+      if (pipe) {
+        ctx.stdout(bytes);
+        continue;
+      }
+      const target = `${base.replace(/\/$/, "")}/${name}`;
+      if (name.endsWith("/")) store.mkdirp(target);
       else {
-        mkdirp(path);
-        write(path, bytes);
+        writeFile(target, bytes);
+        if (!quiet) ctx.print(`  inflating: ${name}\n`);
       }
     }
     return 0;
   };
 
-  // ------------------------------------------------------------------ timeout
-  const timeout = (ctx) => {
-    const argv = argsOf(ctx);
-    const seconds = Number(argv[0]);
-    const command = argv.slice(1);
-    if (!command.length) return fail(ctx, "timeout: missing command");
-    ctx.stderr(`timeout: warning: this sandbox runs synchronously and cannot enforce the ${seconds}s limit\n`);
-    if (!nested) return 127;
-    const quote = (a) => `'${String(a).replace(/'/g, "'\\''")}'`;
-    return nested(ctx, ["-c", command.map(quote).join(" ")]);
+  // ---------------------------------------------------------------- net
+  const curl = (ctx) => {
+    const argv = ctx.args;
+    let method = null;
+    const data = [];
+    let url = null;
+    let output = null;
+    let remoteName = false;
+    let writeOut = "";
+    let head = false;
+    let include = false;
+    let fail = false;
+    let silent = false;
+    let showError = false;
+    let verbose = false;
+    let get = false;
+    const headers = [];
+    const form = [];
+    const readData = (value, binary) => {
+      if (value.startsWith("@")) {
+        const bytes = value === "@-" ? ctx.readAll() : readFile(ctx, value.slice(1));
+        return binary ? bytes : encoder.encode(decoder.decode(bytes).replace(/[\r\n]/g, ""));
+      }
+      return encoder.encode(value);
+    };
+    for (let i = 0; i < argv.length; i++) {
+      let a = argv[i];
+      let inline = null;
+      if (a.startsWith("--") && a.includes("=")) {
+        inline = a.slice(a.indexOf("=") + 1);
+        a = a.slice(0, a.indexOf("="));
+      }
+      const value = () => inline ?? argv[++i] ?? "";
+      if (/^-[a-zA-Z]{2,}$/.test(a)) {
+        const letters = a.slice(1).split("");
+        const takesValue = new Set(["X", "H", "d", "o", "w", "u", "A", "e", "b", "F", "m"]);
+        const expanded = [];
+        for (let k = 0; k < letters.length; k++) {
+          expanded.push(`-${letters[k]}`);
+          if (takesValue.has(letters[k]) && k < letters.length - 1) {
+            expanded.push(letters.slice(k + 1).join(""));
+            break;
+          }
+        }
+        argv.splice(i, 1, ...expanded);
+        i--;
+        continue;
+      }
+      switch (a) {
+        case "-X":
+        case "--request":
+          method = value().toUpperCase();
+          break;
+        case "-d":
+        case "--data":
+        case "--data-ascii":
+          data.push(readData(value(), false));
+          break;
+        case "--data-raw":
+          data.push(encoder.encode(value()));
+          break;
+        case "--data-binary":
+          data.push(readData(value(), true));
+          break;
+        case "--data-urlencode": {
+          const v = value();
+          const eq = v.indexOf("=");
+          data.push(encoder.encode(eq >= 0 ? `${v.slice(0, eq)}=${encodeURIComponent(v.slice(eq + 1))}` : encodeURIComponent(v)));
+          break;
+        }
+        case "--json":
+          data.push(readData(value(), true));
+          headers.push(["content-type", "application/json"], ["accept", "application/json"]);
+          break;
+        case "-F":
+        case "--form":
+          form.push(value());
+          break;
+        case "-H":
+        case "--header": {
+          const h = value();
+          const at = h.indexOf(":");
+          if (at > 0) headers.push([h.slice(0, at).trim(), h.slice(at + 1).trim()]);
+          break;
+        }
+        case "-A":
+        case "--user-agent":
+          headers.push(["user-agent", value()]);
+          break;
+        case "-e":
+        case "--referer":
+          headers.push(["referer", value()]);
+          break;
+        case "-b":
+        case "--cookie":
+          headers.push(["cookie", value()]);
+          break;
+        case "-u":
+        case "--user":
+          headers.push(["authorization", `Basic ${btoa(value())}`]);
+          break;
+        case "-o":
+        case "--output":
+          output = value();
+          break;
+        case "-O":
+        case "--remote-name":
+          remoteName = true;
+          break;
+        case "-w":
+        case "--write-out":
+          writeOut = value();
+          break;
+        case "-I":
+        case "--head":
+          head = true;
+          break;
+        case "-i":
+        case "--include":
+          include = true;
+          break;
+        case "-f":
+        case "--fail":
+        case "--fail-with-body":
+          fail = true;
+          break;
+        case "-s":
+        case "--silent":
+          silent = true;
+          break;
+        case "-S":
+        case "--show-error":
+          showError = true;
+          break;
+        case "-v":
+        case "--verbose":
+          verbose = true;
+          break;
+        case "-G":
+        case "--get":
+          get = true;
+          break;
+        case "--url":
+          url = value();
+          break;
+        case "-m":
+        case "--max-time":
+        case "--connect-timeout":
+        case "--retry":
+        case "--retry-delay":
+        case "--retry-max-time":
+        case "-r":
+        case "--range":
+        case "--limit-rate":
+        case "-K":
+        case "--config":
+        case "-c":
+        case "--cookie-jar":
+          value();
+          break;
+        default:
+          if (!a.startsWith("-")) url = a;
+        // -L, -k, --compressed, -#, --no-progress-meter, -N: the proxy follows
+        // redirects and decompresses already
+      }
+    }
+    if (!url) return ctx.fail("curl: no URL specified!", 2);
+    if (!/^[a-z]+:\/\//i.test(url)) url = `http://${url}`;
+    let body = data.length ? concatBytes(data.flatMap((d, i) => (i ? [encoder.encode("&"), d] : [d]))) : null;
+    if (get && body) {
+      url += (url.includes("?") ? "&" : "?") + decoder.decode(body);
+      body = null;
+    }
+    if (form.length) {
+      const boundary = `----chrysalis${Math.random().toString(16).slice(2)}`;
+      const parts = [];
+      for (const f of form) {
+        const eq = f.indexOf("=");
+        const name = f.slice(0, eq);
+        const v = f.slice(eq + 1);
+        if (v.startsWith("@")) {
+          const file = v.slice(1).split(";")[0];
+          parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"; filename="${file.split("/").pop()}"\r\nContent-Type: application/octet-stream\r\n\r\n`), readFile(ctx, file), encoder.encode("\r\n"));
+        } else parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${v}\r\n`));
+      }
+      parts.push(encoder.encode(`--${boundary}--\r\n`));
+      body = concatBytes(parts);
+      headers.push(["content-type", `multipart/form-data; boundary=${boundary}`]);
+    }
+    if (body && data.length && !form.length && !headers.some(([h]) => h.toLowerCase() === "content-type")) headers.push(["content-type", "application/x-www-form-urlencoded"]);
+    const m = method ?? (head ? "HEAD" : body ? "POST" : "GET");
+    if (verbose) ctx.stderr(encoder.encode(`> ${m} ${url}\n${headers.map(([k, v]) => `> ${k}: ${v}\n`).join("")}>\n`));
+    const res = net.request({ url, method: m, headers, body });
+    if (res.error) {
+      if (!silent || showError) ctx.stderr(encoder.encode(`curl: (7) ${res.error}\n`));
+      return /resolve|lookup|ENOTFOUND/i.test(res.error) ? 6 : 7;
+    }
+    const headerText = `HTTP/1.1 ${res.status}\r\n${res.headers.map(([k, v]) => `${k}: ${v}\r\n`).join("")}\r\n`;
+    if (verbose) ctx.stderr(encoder.encode(headerText.replace(/^/gm, "< ")));
+    if (fail && res.status >= 400) {
+      if (!silent || showError) ctx.stderr(encoder.encode(`curl: (22) The requested URL returned error: ${res.status}\n`));
+      if (!argv.includes("--fail-with-body")) return 22;
+    }
+    const chunks = [];
+    if (include || head) chunks.push(encoder.encode(headerText));
+    if (!head) chunks.push(res.body);
+    const payload = concatBytes(chunks);
+    if (remoteName) output = decodeURIComponent(new URL(url).pathname.split("/").pop() || "index.html");
+    if (output && output !== "-") writeFile(ctx.resolve(output), payload);
+    else ctx.stdout(payload);
+    if (writeOut) {
+      const type = res.headers.find(([k]) => k === "content-type")?.[1] ?? "";
+      ctx.print(
+        writeOut
+          .replace(/%\{http_code\}|%\{response_code\}/g, String(res.status))
+          .replace(/%\{size_download\}/g, String(res.body.length))
+          .replace(/%\{content_type\}/g, type)
+          .replace(/%\{url_effective\}/g, url)
+          .replace(/%\{time_total\}/g, "0.000")
+          .replace(/\\n/g, "\n")
+          .replace(/\\t/g, "\t"),
+      );
+    }
+    return fail && res.status >= 400 ? 22 : 0;
   };
 
-  // ------------------------------------------------------------------ wget
   const wget = (ctx) => {
-    const argv = argsOf(ctx);
+    const argv = ctx.args;
     let output = null;
-    let url = null;
-    const quiet = argv.includes("-q");
+    let prefix = null;
+    let quiet = false;
+    const urls = [];
+    const headers = [];
     for (let i = 0; i < argv.length; i++) {
       const a = argv[i];
-      if (a === "-O" || a === "--output-document") {
-        output = argv[++i] ?? null;
+      if (a === "-O" || a === "--output-document") output = argv[++i];
+      else if (a.startsWith("--output-document=")) output = a.slice(18);
+      else if (a.startsWith("-O") && a.length > 2) output = a.slice(2);
+      else if (a === "-P" || a === "--directory-prefix") prefix = argv[++i];
+      else if (a === "-q" || a === "--quiet" || a === "-nv") quiet = true;
+      else if (a === "--header") {
+        const h = argv[++i] ?? "";
+        const at = h.indexOf(":");
+        if (at > 0) headers.push([h.slice(0, at).trim(), h.slice(at + 1).trim()]);
+      } else if (a === "-U" || a === "--user-agent") headers.push(["user-agent", argv[++i]]);
+      else if (!a.startsWith("-")) urls.push(a);
+    }
+    if (!urls.length) return ctx.fail("wget: missing URL", 1);
+    let code = 0;
+    for (const url of urls) {
+      const res = net.request({ url, headers });
+      if (res.error) {
+        ctx.stderr(encoder.encode(`wget: ${res.error}\n`));
+        code = 4;
         continue;
       }
-      if (a === "-q" || a === "--quiet" || a === "-c" || a === "--continue" || a === "--no-check-certificate" || a === "-nv") continue;
-      if (a.startsWith("-")) continue;
-      url = a;
+      if (res.status >= 400) {
+        ctx.stderr(encoder.encode(`wget: server returned error: HTTP ${res.status}\n`));
+        code = 8;
+        continue;
+      }
+      if (output === "-") ctx.stdout(res.body);
+      else {
+        const name = output ?? (decodeURIComponent(new URL(url).pathname.split("/").pop() || "") || "index.html");
+        const target = ctx.resolve(prefix ? `${prefix}/${name}` : name);
+        writeFile(target, res.body);
+        if (!quiet) ctx.stderr(encoder.encode(`saved '${display(ctx, target)}' (${res.body.length} bytes)\n`));
+      }
     }
-    if (!url) return fail(ctx, "wget: missing URL");
-    if (!net) return fail(ctx, "wget: network is disabled (Settings, Agent)");
-    const res = net(url, "GET", null, []);
-    if (res.error) return fail(ctx, `wget: ${res.error}`);
-    if (output && output !== "-") {
-      write(resolve(ctx, output), encoder.encode(res.body));
-    } else {
-      ctx.stdout(res.body);
-    }
-    return res.status >= 400 ? 8 : 0;
+    return code;
   };
 
-  // ------------------------------------------------------- system-ish fakes
+  // --------------------------------------------------- system-ish answers
   const file = (ctx) => {
-    const files = argsOf(ctx).filter((a) => !a.startsWith("-"));
-    if (!files.length) return fail(ctx, "file: missing file");
-    for (const name of files) {
-      let bytes;
-      try {
-        bytes = read(ctx, name);
-      } catch {
-        ctx.stdout(`${name}: cannot open\n`);
-        continue;
+    const names = ctx.args.filter((a) => !a.startsWith("-"));
+    const brief = ctx.args.includes("-b");
+    const mime = ctx.args.includes("-i") || ctx.args.includes("--mime-type");
+    if (!names.length) return ctx.fail("Usage: file [-bi] FILE...");
+    for (const name of names) {
+      const path = ctx.resolve(name);
+      let kind;
+      if (isDir(path)) kind = mime ? "inode/directory" : "directory";
+      else {
+        const bytes = store.readFile(path);
+        kind = bytes ? sniff(name, bytes, mime) : "cannot open (No such file or directory)";
       }
-      ctx.stdout(`${name}: ${sniff(name, bytes)}\n`);
+      ctx.print(brief ? `${kind}\n` : `${name}: ${kind}\n`);
     }
-    return 0;
-  };
-  const sniff = (name, bytes) => {
-    const head = decoder.decode(bytes.subarray(0, 512));
-    if (bytes.length === 0) return "empty";
-    if (head.includes("\u0000")) return "data";
-    if (/^\s*<(!doctype|html)/i.test(head)) return "HTML document";
-    if (/^\s*[{[]/.test(head)) return "JSON text";
-    if (/^#!/.test(head)) return `script, ${head.split("\n")[0].slice(2, 40)}`;
-    const ext = name.split(".").pop()?.toLowerCase() ?? "";
-    const types = {
-      js: "JavaScript source", mjs: "JavaScript source", ts: "TypeScript source", tsx: "TypeScript source",
-      json: "JSON text", md: "Markdown text", txt: "Unicode text", css: "CSS stylesheet",
-      png: "PNG image data", jpg: "JPEG image data", jpeg: "JPEG image data", gif: "GIF image data",
-      webp: "Web/P image", svg: "SVG image data", wasm: "WebAssembly binary", gz: "gzip compressed data",
-      zip: "Zip archive data", tar: "tar archive", py: "Python script", sh: "shell script", yaml: "YAML text", yml: "YAML text",
-    };
-    return types[ext] ?? "ASCII text";
-  };
-  const strings = (ctx) => {
-    const argv = argsOf(ctx);
-    const min = Number(argv.find((a) => /^-\d+$/.test(a))?.slice(1) ?? 4);
-    const files = argv.filter((a) => !a.startsWith("-"));
-    const sources = files.length ? files.map((f) => read(ctx, f)) : [stdinBytes(ctx)];
-    for (const bytes of sources) {
-      const text = decoder.decode(bytes);
-      const matches = text.match(new RegExp(`[\\x20-\\x7e]{${min},}`, "g")) ?? [];
-      for (const m of matches) ctx.stdout(`${m}\n`);
-    }
-    return 0;
-  };
-  const ps = (ctx) => {
-    ctx.stdout("  PID USER     STAT COMMAND\n    1 sandbox  S    sh\n");
-    return 0;
-  };
-  const df = (ctx) => {
-    const bytes = Object.values(snapshot()).reduce((n, b) => n + b.length, 0);
-    ctx.stdout("Filesystem     1K-blocks      Used Available Use% Mounted on\n");
-    ctx.stdout(`workspace       67108864  ${String(Math.ceil(bytes / 1024)).padStart(8)}  67000000   1% /workspace\n`);
-    return 0;
-  };
-  const uptime = (ctx) => {
-    const seconds = Math.floor(performance.now() / 1000);
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    ctx.stdout(` ${new Date().toTimeString().slice(0, 8)} up ${h}:${String(m).padStart(2, "0")}, 1 user, load average: 0.00, 0.00, 0.00\n`);
     return 0;
   };
 
-  // ------------------------------------------------------------------ chmod
   const chmod = (ctx) => {
-    const argv = argsOf(ctx);
-    const recursive = argv.includes("-R") || argv.includes("-r");
-    const rest = argv.filter((a) => !a.startsWith("-"));
-    const [spec, ...paths] = rest;
-    if (!spec || !paths.length) return fail(ctx, "chmod: usage: chmod [-R] MODE FILE...");
-    const applyOne = (path) => {
-      let current;
-      try {
-        current = store.statSync(path).mode & 0o777;
-      } catch {
-        return false;
-      }
-      let next;
-      if (/^[0-7]{3,4}$/.test(spec)) {
-        next = Number.parseInt(spec, 8);
-      } else {
-        const m = spec.match(/^([ugoa]*)([+\-=])([rwxXst]*)$/);
-        if (!m) return false;
-        const who = m[1] || "a";
-        let mask = 0;
-        for (const letter of m[3]) {
-          const bits = letter === "r" ? 0o4 : letter === "w" ? 0o2 : 0o1;
-          if (who === "a" || who.includes("u")) mask |= bits << 6;
-          if (who === "a" || who.includes("g")) mask |= bits << 3;
-          if (who === "a" || who.includes("o")) mask |= bits;
-        }
-        next = m[2] === "+" ? current | mask : m[2] === "-" ? current & ~mask : mask;
-      }
-      try {
-        store.touchSync(path, { mode: next });
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    const argv = ctx.args;
+    const recursive = argv.includes("-R");
+    const [spec, ...paths] = argv.filter((a) => a !== "-R" && a !== "-v" && a !== "-f" && a !== "-c");
+    if (!spec || !paths.length) return ctx.fail("chmod: usage: chmod [-R] MODE FILE...");
     let failed = false;
+    const apply = (path) => {
+      const current = store.statSync(path).mode & 0o7777;
+      let next = current;
+      if (/^[0-7]{3,4}$/.test(spec)) next = Number.parseInt(spec, 8);
+      else {
+        for (const clause of spec.split(",")) {
+          const m = /^([ugoa]*)([+\-=])([rwxXst]*)$/.exec(clause);
+          if (!m) throw new Error(`chmod: invalid mode: '${spec}'`);
+          const who = m[1] || "a";
+          let mask = 0;
+          for (const letter of m[3]) {
+            const bits = letter === "r" ? 4 : letter === "w" ? 2 : letter === "x" || letter === "X" ? 1 : 0;
+            if (who.includes("a") || who.includes("u")) mask |= bits << 6;
+            if (who.includes("a") || who.includes("g")) mask |= bits << 3;
+            if (who.includes("a") || who.includes("o")) mask |= bits;
+          }
+          next = m[2] === "+" ? next | mask : m[2] === "-" ? next & ~mask : (next & ~(who.includes("a") ? 0o777 : 0)) | mask;
+        }
+      }
+      store.touchSync(path, { mode: next });
+    };
     for (const name of paths) {
-      const path = resolve(ctx, name);
-      if (recursive && isDir(path)) {
-        for (const file of walk(path)) if (!applyOne(file)) failed = true;
-      } else if (!applyOne(path)) {
-        ctx.stderr(`chmod: cannot access '${name}'\n`);
+      const path = ctx.resolve(name);
+      if (!exists(path)) {
+        ctx.stderr(encoder.encode(`chmod: cannot access '${name}': No such file or directory\n`));
         failed = true;
+        continue;
+      }
+      apply(path);
+      if (recursive && isDir(path)) {
+        for (const d of store.walkDirs(path)) apply(d);
+        for (const f of store.walk(path)) apply(f);
       }
     }
     return failed ? 1 : 0;
   };
 
-
-  // --------------------------------------------------------------------- fd
-  const fd = (ctx) => {
-    const argv = argsOf(ctx);
-    let hidden = false;
-    let type = null;
-    let ext = null;
-    const rest = [];
-    for (let i = 0; i < argv.length; i++) {
-      const a = argv[i];
-      if (a === "-H" || a === "--hidden" || a === "-u" || a === "--no-ignore") hidden = true;
-      else if (a === "-t" || a === "--type") type = argv[++i];
-      else if (a === "-e" || a === "--extension") ext = String(argv[++i] ?? "").replace(/^\./, "");
-      else if (a.startsWith("-")) continue;
-      else rest.push(a);
+  const ln = (ctx) => {
+    const argv = ctx.args.filter((a) => !a.startsWith("-"));
+    const force = ctx.args.some((a) => /^-[a-z]*f/.test(a));
+    if (argv.length < 2) return ctx.fail("ln: missing destination file operand");
+    const dest = argv.pop();
+    const destAbs = ctx.resolve(dest);
+    for (const target of argv) {
+      // No links exist in this filesystem; a copy is the closest thing that
+      // keeps scripts working.
+      const src = ctx.resolve(target);
+      if (!exists(src)) return ctx.fail(`ln: failed to access '${target}': No such file or directory`);
+      const to = isDir(destAbs) ? `${destAbs}/${src.split("/").pop()}` : destAbs;
+      if (exists(to) && !force) return ctx.fail(`ln: failed to create link '${dest}': File exists`);
+      if (isDir(src)) {
+        for (const f of store.walk(src)) writeFile(to + f.slice(src.length), store.readFile(f).slice());
+      } else writeFile(to, store.readFile(src).slice());
     }
-    const pattern = rest.length > 1 || (rest.length === 1 && !isDir(resolve(ctx, rest[0]))) ? rest.shift() : null;
-    const root = resolve(ctx, rest[0] ?? ".");
-    const re = pattern ? new RegExp(pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i") : null;
-    const files = walk(root);
-    // Directories exist only as prefixes of file paths in the store.
-    const dirs = new Set();
-    for (const path of files) {
-      let dir = path.slice(0, path.lastIndexOf("/"));
-      while (dir.length > root.length && dir.startsWith(root)) {
-        dirs.add(dir);
-        dir = dir.slice(0, dir.lastIndexOf("/"));
-      }
-    }
-    const candidates = type === "d" ? [...dirs].sort() : files;
-    let found = false;
-    for (const path of candidates) {
-      const name = path.split("/").pop() ?? "";
-      if (!hidden && name.startsWith(".")) continue;
-      if (type === "f" && isDir(path)) continue;
-      if (type === "d" && !dirs.has(path)) continue;
-      if (ext && !name.endsWith(`.${ext}`)) continue;
-      if (re && !re.test(name)) continue;
-      found = true;
-      ctx.stdout(`${display(ctx, path)}\n`);
-    }
-    return found ? 0 : 1;
-  };
-
-  // ------------------------------------------------------------------- head
-  // `-c` for head/tail: busybox here has neither -c nor dd, so the shell
-  // prologue forwards the byte-count form to these two (argv: N [file]).
-  const headBytes = (ctx) => {
-    const argv = argsOf(ctx);
-    const count = Math.max(0, Number(argv[0] ?? 0));
-    const bytes = argv[1] ? read(ctx, argv[1]) : stdinBytes(ctx);
-    ctx.stdout(bytes.subarray(0, count));
-    return 0;
-  };
-  const tailBytes = (ctx) => {
-    const argv = argsOf(ctx);
-    const count = Math.max(0, Number(argv[0] ?? 0));
-    const bytes = argv[1] ? read(ctx, argv[1]) : stdinBytes(ctx);
-    ctx.stdout(bytes.subarray(Math.max(0, bytes.length - count)));
     return 0;
   };
 
-  const tools = {
+  const timeout = (ctx) => {
+    const argv = ctx.args.slice();
+    while (argv[0]?.startsWith("-")) {
+      const a = argv.shift();
+      if (a === "-s" || a === "-k" || a === "--signal" || a === "--kill-after") argv.shift();
+    }
+    argv.shift(); // the duration: the sandbox's own per-command limit applies instead
+    if (!argv.length) return ctx.fail("timeout: missing operand", 125);
+    return shell.spawn(argv, { cwd: ctx.cwd, env: ctx.env, stdin: ctx.stdin, stdout: ctx.stdout, stderr: ctx.stderr });
+  };
+
+  return {
     which,
-    whoami,
-    id,
-    hostname,
-    base64,
-    readlink,
-    tee,
-    ln,
-    tree,
-    rg,
     jq,
-    diff,
-    cmp,
-    gzip,
-    gunzip,
-    zcat,
+    rg,
+    fd,
+    fdfind: fd,
     tar,
+    gzip: gzipTool("gzip"),
+    gunzip: gzipTool("gunzip"),
+    zcat: gzipTool("zcat"),
     zip,
     unzip,
-    timeout,
+    curl,
     wget,
     file,
-    strings,
-    ps,
-    df,
-    uptime,
     chmod,
-    fd,
-    _head: headBytes,
-    _tail: tailBytes,
+    ln,
+    timeout,
+    nohup: timeout,
+    whoami: (ctx) => (ctx.print("sandbox\n"), 0),
+    id: (ctx) => (ctx.print("uid=1000(sandbox) gid=1000(sandbox) groups=1000(sandbox)\n"), 0),
+    hostname: (ctx) => (ctx.print("sandbox\n"), 0),
+    ps: (ctx) => (ctx.print("  PID TTY          TIME CMD\n    1 ?        00:00:00 sh\n"), 0),
+    df: (ctx) => {
+      const used = Math.ceil(store.totalBytes() / 1024);
+      ctx.print(`Filesystem     1K-blocks      Used Available Use% Mounted on\nsandbox          ${String(used + 1048576).padStart(8)} ${String(used).padStart(9)}   1048576   ${Math.min(99, Math.round((used / (used + 1048576)) * 100))}% /\n`);
+      return 0;
+    },
+    uptime: (ctx) => (ctx.print(` ${new Date().toTimeString().slice(0, 8)} up 0 min,  1 user,  load average: 0.00, 0.00, 0.00\n`), 0),
+    clear: () => 0,
   };
-  return tools;
+}
+
+// ------------------------------------------------------------ helpers
+function concatBytes(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+/** A glob as a RegExp over a relative path: `*` stays within a segment, `**`
+ *  crosses them, {a,b} alternates; unanchored globs match at any depth. */
+export function globRe(glob, anchored, insensitive = false) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        re += glob[i + 2] === "/" ? "(?:.*/)?" : ".*";
+        i += glob[i + 2] === "/" ? 2 : 1;
+      } else re += "[^/]*";
+    } else if (c === "?") re += "[^/]";
+    else if (c === "{") {
+      const end = glob.indexOf("}", i);
+      if (end < 0) re += "\\{";
+      else {
+        re += `(?:${glob
+          .slice(i + 1, end)
+          .split(",")
+          .map((alt) => alt.replace(/[.+^$()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]"))
+          .join("|")})`;
+        i = end;
+      }
+    } else if (c === "[") {
+      const end = glob.indexOf("]", i);
+      if (end < 0) re += "\\[";
+      else {
+        re += `[${glob.slice(i + 1, end).replace(/^!/, "^")}]`;
+        i = end;
+      }
+    } else re += c.replace(/[.+^$()|\\]/g, "\\$&");
+  }
+  return new RegExp(anchored ? `^${re}$` : `(?:^|/)${re}$`, insensitive ? "i" : "");
+}
+
+function sniff(name, bytes, mime) {
+  const head = bytes.subarray(0, 16);
+  const starts = (...sig) => sig.every((b, i) => head[i] === b);
+  const kinds = [
+    [starts(0x89, 0x50, 0x4e, 0x47), "PNG image data", "image/png"],
+    [starts(0xff, 0xd8, 0xff), "JPEG image data", "image/jpeg"],
+    [starts(0x47, 0x49, 0x46, 0x38), "GIF image data", "image/gif"],
+    [starts(0x52, 0x49, 0x46, 0x46) && decoder.decode(bytes.subarray(8, 12)) === "WEBP", "RIFF (little-endian) data, Web/P image", "image/webp"],
+    [starts(0x52, 0x49, 0x46, 0x46) && decoder.decode(bytes.subarray(8, 12)) === "WAVE", "RIFF (little-endian) data, WAVE audio", "audio/x-wav"],
+    [starts(0x49, 0x44, 0x33) || starts(0xff, 0xfb), "Audio file with ID3 / MPEG ADTS", "audio/mpeg"],
+    [starts(0x4f, 0x67, 0x67, 0x53), "Ogg data", "audio/ogg"],
+    [starts(0x00, 0x61, 0x73, 0x6d), "WebAssembly (wasm) binary module", "application/wasm"],
+    [starts(0x1f, 0x8b), "gzip compressed data", "application/gzip"],
+    [starts(0x50, 0x4b, 0x03, 0x04), "Zip archive data", "application/zip"],
+    [starts(0x25, 0x50, 0x44, 0x46), "PDF document", "application/pdf"],
+  ];
+  for (const [hit, text, type] of kinds) if (hit) return mime ? type : text;
+  if (bytes.length === 0) return mime ? "inode/x-empty" : "empty";
+  if (bytes.subarray(0, 8000).includes(0)) return mime ? "application/octet-stream" : "data";
+  const text = decoder.decode(bytes.subarray(0, 1024));
+  if (/^#!/.test(text)) return mime ? "text/x-shellscript" : `${text.split("\n")[0].slice(2).trim()} script, ASCII text executable`;
+  if (/^\s*<(!doctype html|html)/i.test(text)) return mime ? "text/html" : "HTML document, UTF-8 Unicode text";
+  if (/^\s*<svg|^\s*<\?xml[^>]*>\s*<svg/i.test(text)) return mime ? "image/svg+xml" : "SVG Scalable Vector Graphics image";
+  if (/^\s*[{[]/.test(text) && /\.(json|jsonl)$/i.test(name)) return mime ? "application/json" : "JSON text data";
+  const ascii = !/[^\x00-\x7f]/.test(text);
+  return mime ? "text/plain" : `${ascii ? "ASCII" : "UTF-8 Unicode"} text`;
+}
+
+const TAR_BLOCK = 512;
+function tarCreate(entries) {
+  const blocks = [];
+  const header = (name, size, type, mode) => {
+    const h = new Uint8Array(TAR_BLOCK);
+    const put = (offset, length, text) => h.set(encoder.encode(text).subarray(0, length), offset);
+    const octal = (value, length) => `${value.toString(8).padStart(length - 1, "0")}\0`;
+    let short = name;
+    let prefix = "";
+    if (encoder.encode(name).length > 100) {
+      const cut = name.lastIndexOf("/", name.length - 1 - (name.endsWith("/") ? 1 : 0));
+      if (cut > 0 && cut <= 155 && name.length - cut - 1 <= 100) {
+        prefix = name.slice(0, cut);
+        short = name.slice(cut + 1);
+      } else {
+        blocks.push(header("././@LongLink", encoder.encode(name).length + 1, "L", 0o644));
+        const long = new Uint8Array(Math.ceil((encoder.encode(name).length + 1) / TAR_BLOCK) * TAR_BLOCK);
+        long.set(encoder.encode(name));
+        blocks.push(long);
+        short = name.slice(0, 100);
+      }
+    }
+    put(0, 100, short);
+    put(100, 8, octal(mode || (type === "5" ? 0o755 : 0o644), 8));
+    put(108, 8, octal(0, 8));
+    put(116, 8, octal(0, 8));
+    put(124, 12, octal(size, 12));
+    put(136, 12, octal(Math.floor(Date.now() / 1000), 12));
+    h.fill(0x20, 148, 156);
+    h[156] = type.charCodeAt(0);
+    put(257, 6, "ustar\0");
+    put(263, 2, "00");
+    put(265, 32, "sandbox");
+    put(297, 32, "sandbox");
+    if (prefix) put(345, 155, prefix);
+    let sum = 0;
+    for (const b of h) sum += b;
+    put(148, 8, `${sum.toString(8).padStart(6, "0")}\0 `);
+    return h;
+  };
+  for (const e of entries) {
+    if (e.dir) {
+      blocks.push(header(e.name, 0, "5", 0o755));
+      continue;
+    }
+    const size = e.bytes?.length ?? 0;
+    blocks.push(header(e.name, size, "0", e.mode));
+    if (size) {
+      blocks.push(e.bytes);
+      const pad = (TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK;
+      if (pad) blocks.push(new Uint8Array(pad));
+    }
+  }
+  blocks.push(new Uint8Array(TAR_BLOCK * 2));
+  return concatBytes(blocks);
+}
+
+function tarRead(data) {
+  const entries = [];
+  let off = 0;
+  let longName = null;
+  while (off + TAR_BLOCK <= data.length) {
+    const h = data.subarray(off, off + TAR_BLOCK);
+    if (h.every((b) => b === 0)) break;
+    const field = (start, length) => {
+      const raw = h.subarray(start, start + length);
+      const end = raw.indexOf(0);
+      return decoder.decode(end >= 0 ? raw.subarray(0, end) : raw);
+    };
+    const size = Number.parseInt(field(124, 12).trim() || "0", 8);
+    const type = String.fromCharCode(h[156] || 0x30);
+    const mode = Number.parseInt(field(100, 8).trim() || "644", 8);
+    const prefix = field(345, 155);
+    let name = longName ?? (prefix ? `${prefix}/${field(0, 100)}` : field(0, 100));
+    longName = null;
+    off += TAR_BLOCK;
+    const body = data.subarray(off, off + size);
+    off += Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;
+    if (Number.isNaN(size)) throw new Error("This does not look like a tar archive");
+    if (type === "L") {
+      longName = decoder.decode(body).replace(/\0.*$/s, "");
+      continue;
+    }
+    if (type === "x" || type === "g") {
+      const path = /\d+ path=([^\n]*)\n/.exec(decoder.decode(body));
+      if (path && type === "x") longName = path[1];
+      continue;
+    }
+    name = name.replace(/^\.\//, "");
+    if (type === "5") entries.push({ name, dir: true });
+    else if (type === "0" || type === "\0" || type === "7") entries.push({ name, bytes: body, mode: mode & 0o777 });
+  }
+  return entries;
 }

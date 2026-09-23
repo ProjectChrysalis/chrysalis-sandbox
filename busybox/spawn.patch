@@ -1,0 +1,40 @@
+--- a/libbb/vfork_daemon_rexec.c
++++ b/libbb/vfork_daemon_rexec.c
+@@ -271,7 +271,7 @@
+ 	if (a >= 0) {
+ 		if (APPLET_IS_NOFORK(a))
+ 			return run_nofork_applet(a, argv);
+-# if BB_MMU /* NOEXEC needs fork(), thus this is done only on MMU machines: */
++# if BB_MMU && !defined(__wasi__) /* NOEXEC needs fork(), thus this is done only on MMU machines: */
+ 		if (APPLET_IS_NOEXEC(a)) {
+ 			fflush_all();
+ 			rc = fork();
+@@ -284,6 +284,13 @@
+ # endif
+ 	}
+ #endif
++#ifdef __wasi__
++	/* No fork: the embedder runs the child on the same files and fds. */
++	{
++		extern int host_spawn_and_wait(char **argv);
++		return host_spawn_and_wait(argv);
++	}
++#endif
+ 	rc = spawn(argv);
+ 	return wait4pid(rc);
+ }
+--- a/coreutils/env.c
++++ b/coreutils/env.c
+@@ -89,6 +89,12 @@
+ 	}
+ 
+ 	if (argv[0]) {
++#ifdef __wasi__
++		{
++			extern int host_spawn_and_wait(char **argv);
++			return host_spawn_and_wait(argv);
++		}
++#endif
+ 		BB_EXECVP_or_die(argv);
+ 	}
+ 

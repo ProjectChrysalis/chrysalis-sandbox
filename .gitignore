@@ -1,8 +1,9 @@
 node_modules/
-dist/
+/dist/
 public/
 cache/
 references/
+vendor/python/
 *.zip
 SHA256SUMS
 .DS_Store

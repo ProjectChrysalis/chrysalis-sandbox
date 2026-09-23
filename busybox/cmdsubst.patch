@@ -1,0 +1,29 @@
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -6984,7 +6984,25 @@
+ 	INTOFF;
+ 	startloc = expdest - (char *)stackblock();
+ 	pushstackmark(&smark, startloc);
+-	evalbackcmd(cmd, &in IF_BASH_PROCESS_SUBST(, ctl));
++	{
++		/* The command runs in this process, and expanding its own words
++		 * reuses the globals the outer word is still being built in: the
++		 * split points "$@" recorded, the pending argument list and the
++		 * queue of later substitutions. Park them, let the inner command
++		 * start clean, and put them back. */
++		struct ifsregion saved_ifsfirst = ifsfirst;
++		struct ifsregion *saved_ifslastp = ifslastp;
++		struct arglist saved_exparg = exparg;
++		struct nodelist *saved_argbackq = argbackq;
++		ifsfirst.next = NULL;
++		ifslastp = NULL;
++		evalbackcmd(cmd, &in IF_BASH_PROCESS_SUBST(, ctl));
++		ifsfree();
++		ifsfirst = saved_ifsfirst;
++		ifslastp = saved_ifslastp;
++		exparg = saved_exparg;
++		argbackq = saved_argbackq;
++	}
+ 	popstackmark(&smark);
+ 	/* fork-free cmdsubst runs evaltree in-process, which mutates the global
+ 	 * expdest and reallocs the string stack; the forked path never did.
