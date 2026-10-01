@@ -314,7 +314,9 @@ export function makeTools({ store, net, shell }) {
       if (!rest.length) return ctx.fail("rg: no pattern given", 2);
       patterns.push(rest.shift());
     }
-    const paths = rest.length ? rest : ["."];
+    const readStdin = !o.files && (rest.includes("-") || (!rest.length && ctx.stdinRedirected));
+    const stdinBytes = readStdin ? ctx.readAll() : null;
+    const paths = rest.length ? rest : readStdin ? ["-"] : ["."];
     let flags = "";
     if (o.i || (o.smart && !patterns.some((p) => /[A-Z]/.test(p)))) flags += "i";
     let re;
@@ -351,6 +353,7 @@ export function makeTools({ store, net, shell }) {
     };
     const targets = [];
     for (const p of paths) {
+      if (p === "-" && stdinBytes !== null) { targets.push([null, "<stdin>", true]); continue; }
       const abs = ctx.resolve(p);
       if (!exists(abs)) {
         ctx.stderr(encoder.encode(`rg: ${p}: No such file or directory (os error 2)\n`));
@@ -372,10 +375,10 @@ export function makeTools({ store, net, shell }) {
       if (out.length) ctx.print(out.splice(0).join(""));
     };
     for (const [file, arg, explicit] of targets) {
-      const bytes = store.readFile(file);
+      const bytes = file === null ? stdinBytes : store.readFile(file);
       if (!bytes) continue;
       if (!explicit && bytes.subarray(0, 8192).includes(0)) continue;
-      const name = display(ctx, file, arg.startsWith("/") ? arg : null).replace(/^\.\//, "");
+      const name = file === null ? "<stdin>" : display(ctx, file, arg.startsWith("/") ? arg : null).replace(/^\.\//, "");
       if (o.files) {
         out.push(`${name}\n`);
         continue;
@@ -385,7 +388,8 @@ export function makeTools({ store, net, shell }) {
       let hits = 0;
       let lastPrinted = -1;
       const pending = [];
-      const prefix = (n, sep) => `${showName && !o.heading ? `${name}${sep}` : ""}${o.n ? `${n + 1}${sep}` : ""}`;
+      const showLine = o.n && (file !== null || argv.includes("-n") || argv.includes("--line-number"));
+      const prefix = (n, sep) => `${showName && !o.heading ? `${name}${sep}` : ""}${showLine ? `${n + 1}${sep}` : ""}`;
       for (let n = 0; n < lines.length && hits < o.max; n++) {
         re.lastIndex = 0;
         const line = lines[n];

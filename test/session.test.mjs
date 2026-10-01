@@ -46,6 +46,20 @@ describe("files", () => {
 });
 
 describe("shell", () => {
+  test("rg reads piped, redirected and explicit stdin, including empty pipes", async () => {
+    const r = await sb.run("printf 'alpha\\nbeta\\n' | rg beta; printf 'one\\ntwo\\n' | rg -n two -; printf '' | rg k; printf 'EMPTY=%s\\n' $?; printf '' | sh -c 'rg k'; printf 'NESTED=%s\\n' $?; rg 2 < a/b/two.txt");
+    expect(r.err).toBe("");
+    expect(r.out).toBe("beta\n2:two\nEMPTY=1\nNESTED=1\n2\n");
+  });
+
+  test("sleep waits instead of immediately reporting success", async () => {
+    const start = performance.now();
+    const r = await sb.run("sleep 1; printf awake");
+    expect(r.code).toBe(0);
+    expect(r.out).toBe("awake");
+    expect(performance.now() - start).toBeGreaterThanOrEqual(900);
+  });
+
   test("GNU-style options agents type", async () => {
     const r = await sb.run('grep -rn --include="*.txt" 2 .; find . -maxdepth 1 -type d | sort; head -c 3 card.json; echo; ls -R a | head -1; sort -k2 -n <<< "b 2\na 1"');
     expect(r.code).toBe(0);

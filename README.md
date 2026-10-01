@@ -30,7 +30,10 @@ checks use the repository's index, `.gitignore` files, `.git/info/exclude`
 and its configured `core.excludesFile`, all inside the virtual filesystem.
 Other merge-base modes are refused explicitly. The shell remains busybox
 ash; GNU-only options are not universal (use `ls -l --full-time` for full
-timestamps).
+timestamps). `rg` searches piped or redirected input, or explicit `-`,
+without scanning the workspace. Whole-second `sleep` waits are honored;
+fractional durations are not enabled in this BusyBox build (use Python
+`time.sleep` when a script needs subsecond timing).
 
 ## Built with
 

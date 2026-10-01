@@ -34,9 +34,10 @@ const joinPath = (cwd, p) => {
 export const resolvePath = joinPath;
 
 /** An input over a reader that says EOF by returning nothing. */
-const streamInput = (read) => {
+const streamInput = (read, redirected = false) => {
   let eof = false;
   return {
+    redirected,
     pollReadable: () => !eof,
     read(max) {
       if (eof) return EMPTY;
@@ -47,7 +48,17 @@ const streamInput = (read) => {
     readBlocking(max) {
       return this.read(max);
     },
-    wait() {},
+    wait(ms) {
+      const duration = Math.max(0, Number(ms) || 0);
+      if (!duration) return;
+      // The shell runs synchronously in a worker. Shared memory permits an
+      // efficient wait; opaque browser workers may need a clock loop instead.
+      if (typeof SharedArrayBuffer === "function") {
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, duration); return; } catch {}
+      }
+      const deadline = performance.now() + duration;
+      while (performance.now() < deadline) {}
+    },
     closed: () => eof,
   };
 };
@@ -57,7 +68,7 @@ export const fixedInput = (bytes) => {
     const take = bytes.subarray(off, Math.min(bytes.length, off + max));
     off += take.length;
     return take;
-  });
+  }, bytes.length > 0);
 };
 
 /** Bounded capture: the first and last `half` bytes of a stream, with the
@@ -177,6 +188,11 @@ export class Shell {
   /** One busybox instance, run to completion. */
   instance(args, { env, input, stdout, stderr }) {
     const shim = new WasiShim({ args, env, files: {}, fs: this.store, stdout, stderr, input, builtins: this.provider });
+    const redirected = () => shim.fds.get(0)?.type !== "stdin" || input.redirected === true;
+    shim.builtins = {
+      lookup: this.provider.lookup,
+      run: (ctx) => this.provider.run({ ...ctx, stdinRedirected: redirected() }),
+    };
     const imports = completeImports(shim, shim.imports());
     imports.env.__host_spawn = (cwdPtr, argc, argvPtr, envpPtr) => {
       try {
@@ -185,6 +201,7 @@ export class Shell {
           cwd: shim.cstr(cwdPtr) || "/",
           env: envObject(shim.cstrv(envpPtr)),
           stdin: (max) => shim.readFd(0, max, false).data.slice(),
+          stdinRedirected: redirected(),
           stdout: (b) => shim.writeFd(1, bytesOf(b)),
           stderr: (b) => shim.writeFd(2, bytesOf(b)),
         });
@@ -223,14 +240,14 @@ export class Shell {
   }
 
   /** A child command from inside a running shell or builtin. */
-  spawn(argv, { cwd, env, stdin, stdout, stderr }) {
-    const ctx = this.wrap({ argv, cwd, env, stdin: stdin ?? (() => EMPTY), stdout, stderr, fs: null, interrupted: () => false });
+  spawn(argv, { cwd, env, stdin, stdinRedirected = false, stdout, stderr }) {
+    const ctx = this.wrap({ argv, cwd, env, stdin: stdin ?? (() => EMPTY), stdinRedirected, stdout, stderr, fs: null, interrupted: () => false });
     if (this.commands.has(argv[0]) || argv[0]?.includes("/")) return this.dispatch(ctx);
     // An applet or a shell builtin: a fresh instance runs exactly this argv.
     const script = `cd -- ${quote(cwd)} || exit 1; ${argv.map(quote).join(" ")}`;
     return this.instance(["busybox", "ash", "-c", script], {
       env: { ...env, PWD: cwd },
-      input: streamInput(stdin ?? (() => EMPTY)),
+      input: streamInput(stdin ?? (() => EMPTY), stdinRedirected),
       stdout,
       stderr,
     });
@@ -318,7 +335,7 @@ export class Shell {
     }
     return this.instance(argv, {
       env: { ...ctx.env, PWD: ctx.cwd },
-      input: streamInput((max) => ctx.stdin(max)),
+      input: streamInput((max) => ctx.stdin(max), ctx.stdinRedirected === true),
       stdout: (b) => ctx.stdout(b),
       stderr: (b) => ctx.stderr(b),
     });
