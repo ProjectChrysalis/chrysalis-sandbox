@@ -6,6 +6,7 @@
 // commit -a, rev-parse options, config --list, grep, clean, ls-tree.
 import { runLg2 } from "./lg2.mjs";
 import { entryFor, readIndex, writeBlob, writeIndex } from "./gitindex.mjs";
+import { ignoreMatch } from "./gitignore.mjs";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -275,6 +276,88 @@ class Git {
   }
 
   // ----------------------------------------------------------- commands
+  cmd_merge_base(args) {
+    const ancestor = args.includes("--is-ancestor");
+    const all = args.includes("--all") || args.includes("-a");
+    const revs = args.filter((a) => !a.startsWith("-"));
+    if (args.some((a) => a.startsWith("-") && !["--is-ancestor", "--all", "-a"].includes(a)) || revs.length !== 2 || (ancestor && all)) {
+      return this.fatal("usage: git merge-base [--all | --is-ancestor] <commit> <commit>", 129);
+    }
+    const shas = revs.map((r) => this.resolve(`${r}^{commit}`));
+    if (shas.some((s) => !s)) return this.fatal("not a valid commit name");
+    const parents = new Map();
+    const walk = (start) => {
+      const seen = new Set();
+      const todo = [start];
+      while (todo.length) {
+        const sha = todo.pop();
+        if (seen.has(sha)) continue;
+        seen.add(sha);
+        if (!parents.has(sha)) {
+          const r = this.lg(["cat-file", "-p", sha]);
+          if (r.code !== 0) throw new Error(`cannot read commit ${sha}`);
+          parents.set(sha, [...text(r.out).split("\n\n", 1)[0].matchAll(/^parent ([0-9a-f]{40})$/gm)].map((m) => m[1]));
+        }
+        todo.push(...parents.get(sha));
+      }
+      return seen;
+    };
+    const right = walk(shas[1]);
+    if (ancestor) return right.has(shas[0]) ? 0 : 1;
+    const left = walk(shas[0]);
+    const common = [...left].filter((s) => right.has(s));
+    // A common ancestor is a best base only if no newer common ancestor
+    // descends from it. Multiple bases occur in criss-cross merges.
+    const older = new Set();
+    const todo = common.flatMap((sha) => parents.get(sha));
+    while (todo.length) {
+      const sha = todo.pop();
+      if (older.has(sha)) continue;
+      older.add(sha);
+      todo.push(...parents.get(sha));
+    }
+    const best = common.filter((s) => !older.has(s)).sort();
+    if (!best.length) return 1;
+    this.out(`${(all ? best : best.slice(0, 1)).join("\n")}\n`);
+    return 0;
+  }
+
+  cmd_check_ignore(args) {
+    const opts = { verbose: false, quiet: false, stdin: false, nul: false, nonMatching: false, noIndex: false };
+    const paths = [];
+    let literal = false;
+    const flags = { "-v": "verbose", "--verbose": "verbose", "-q": "quiet", "--quiet": "quiet", "--stdin": "stdin", "-z": "nul", "-n": "nonMatching", "--non-matching": "nonMatching", "--no-index": "noIndex" };
+    for (const a of args) {
+      if (literal || !a.startsWith("-")) paths.push(a);
+      else if (a === "--") literal = true;
+      else if (flags[a]) opts[flags[a]] = true;
+      else return this.fatal(`unknown option '${a}'`, 129);
+    }
+    if (opts.stdin && paths.length) return this.fatal("cannot specify pathnames with --stdin");
+    if (opts.stdin) paths.push(...text(this.ctx.readAll()).split(opts.nul ? "\0" : "\n").filter(Boolean));
+    if (!opts.stdin && !paths.length) return this.fatal("no path specified");
+    if (opts.quiet && (paths.length !== 1 || opts.verbose || opts.nonMatching)) return this.fatal("--quiet requires one pathname and no output options");
+    if (opts.nonMatching && !opts.verbose) return this.fatal("--non-matching requires --verbose");
+    const tracked = opts.noIndex ? new Set() : new Set(this.index().entries.map((e) => e.path));
+    const config = text(this.store.readFile(`${this.repo.gitDir}/config`) ?? new Uint8Array());
+    const excludeSetting = parseConfig(config).filter(([k]) => k === "core.excludesfile").at(-1)?.[1];
+    const excludesFile = excludeSetting ? this.ctx.resolve(excludeSetting.replace(/^~\//, `${this.ctx.env.HOME ?? "/workspace"}/`)) : null;
+    let matched = false;
+    for (const path of paths) {
+      const rel = this.rel(path);
+      if (rel === null) return this.fatal(`${path}: path is outside the repository`);
+      const target = path.endsWith("/") ? `${rel}/` : rel;
+      const rule = tracked.has(rel) ? null : ignoreMatch(this.store, this.repo, target, excludesFile, excludeSetting?.startsWith("~/") ? excludesFile : excludeSetting);
+      if (rule && (!rule.negate || opts.verbose)) matched = true;
+      if (opts.quiet) continue;
+      if (opts.verbose && (rule || opts.nonMatching)) {
+        const fields = rule ? [rule.source, String(rule.line), rule.pattern, path] : ["", "", "", path];
+        this.out(opts.nul ? `${fields.join("\0")}\0` : `${fields[0]}:${fields[1]}:${fields[2]}\t${fields[3]}\n`);
+      } else if (rule && !rule.negate) this.out(`${path}${opts.nul ? "\0" : "\n"}`);
+    }
+    return matched ? 0 : 1;
+  }
+
   cmd_init(args) {
     let branch = null;
     let dir = null;
@@ -1520,5 +1603,5 @@ Working with files:  status, add [-A|-u], rm, mv, restore [--staged], reset, cle
 History:             commit [-a] [-m], log [--oneline|--format=|-p|--stat], show, blame, grep, ls-files, ls-tree
 Branches:            branch, switch [-c], checkout [-b], merge, tag, stash
 Remotes:             clone, fetch, pull, push, remote
-Plumbing:            rev-parse, rev-list, cat-file, for-each-ref, show-ref, config, describe
+Plumbing:            rev-parse, rev-list, merge-base, check-ignore, cat-file, for-each-ref, show-ref, config, describe
 `;

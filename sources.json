@@ -1,7 +1,7 @@
 {
   "runtime": {
     "name": "chrysalis-sandbox",
-    "version": "0.4.0",
+    "version": "0.4.1",
     "license": "GPL-2.0-only",
     "source": "https://github.com/ProjectChrysalis/chrysalis-sandbox",
     "note": "the runtime links busybox and wasm-git (both GPL-2.0-only), so the combined work is GPL-2.0-only; the other parts are under compatible licenses"

@@ -24,6 +24,14 @@ bun test
 
 Point the engine at a local checkout with `CHRYSALIS_SANDBOX_DIR=/path/to/repo`.
 
+Git includes two-commit `merge-base` (`--all` and `--is-ancestor`) and
+`check-ignore` (`-v`, `-q`, `--stdin`, `-z`, `-n`, `--no-index`). Ignore
+checks use the repository's index, `.gitignore` files, `.git/info/exclude`
+and its configured `core.excludesFile`, all inside the virtual filesystem.
+Other merge-base modes are refused explicitly. The shell remains busybox
+ash; GNU-only options are not universal (use `ls -l --full-time` for full
+timestamps).
+
 ## Built with
 
 | Project | What it does here | License |
