@@ -56,3 +56,5 @@ GPL-2.0-only. The runtime links busybox and wasm-git, both GPL-2.0-only, so
 that is the license the combined work carries. Chrysalis Engine stays a
 separate program under its own license and drives this runtime through a
 worker boundary (`runtime/session.mjs`).
+
+The 0.4.1 release also provides [source and build materials](https://github.com/ProjectChrysalis/chrysalis-sandbox/releases/download/v0.4.1/sandbox-0.4.1-sources.zip): the release source tree, full pinned upstream GPL sources, configurations, patches and build scripts. The source archive has a separate `SOURCE_SHA256SUMS`; the runtime archive checksum is unchanged.
