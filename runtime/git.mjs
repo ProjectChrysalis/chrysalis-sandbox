@@ -748,34 +748,60 @@ class Git {
 
   cmd_diff(args) {
     const out = [];
+    const paths = [];
+    const formats = [];
+    let patch = false;
     let quiet = false;
     let exitCode = false;
     let afterDash = false;
-    for (const a of args) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
       if (afterDash) {
-        out.push(a);
+        paths.push(a);
         continue;
       }
       if (a === "--") {
         afterDash = true;
-        out.push(a);
       } else if (a === "--staged") out.push("--cached");
+      else if (["--stat", "--numstat", "--shortstat", "--name-only", "--name-status"].includes(a)) formats.push(a);
+      else if (a === "-p" || a === "-u" || a === "--patch") patch = true;
       else if (a === "--quiet") quiet = exitCode = true;
       else if (a === "--exit-code") exitCode = true;
       else if (a === "--no-index") return this.noIndexDiff(args.filter((x) => !x.startsWith("-")));
-      else if (/^--(no-)?colou?r/.test(a) || a === "--no-ext-diff" || a === "-w" || a === "--ignore-all-space" || a === "--minimal") continue;
+      else if (/^--(no-)?colou?r/.test(a) || a === "--no-ext-diff") continue;
+      else if (["--src-prefix", "--dst-prefix"].includes(a)) out.push(a, args[++i] ?? "");
       else if (/^[^-].*\.\.\.?/.test(a) && !this.store.exists(this.ctx.resolve(a))) {
         const [from, to] = a.split(/\.\.\.?/);
         out.push(from || "HEAD", to || "HEAD");
-      } else out.push(a);
+      } else if (!a.startsWith("-") && !this.resolve(a) && this.store.exists(this.ctx.resolve(a))) paths.push(a);
+      else out.push(a);
     }
-    const r = this.lg(["diff", ...out], this.cwd);
+    const { specs, error } = this.specsOf(paths);
+    if (error) return this.fatal(error);
+    // The backend accepts tree identifiers only; path selection and summary
+    // formats must use the same selected patch so counts stay consistent.
+    const r = this.lg(["diff", ...out]);
     if (r.code !== 0) {
       this.err(/revspec|looking up/.test(r.err) ? `fatal: bad revision '${out.find((x) => !x.startsWith("-")) ?? ""}'\n` : r.err);
       return 128;
     }
-    if (!quiet) this.out(r.out);
-    return exitCode && r.out.length ? 1 : 0;
+    const blocks = text(r.out).split(/(?=^diff --git )/m).filter(Boolean);
+    const selected = paths.length ? blocks.filter((block) => {
+      const m = /^diff --git a\/(.*) b\/(.*)\n/.exec(block);
+      return m && (this.inSpec(m[1], specs) || this.inSpec(m[2], specs));
+    }).join("") : text(r.out);
+    const lines = selected.split("\n");
+    const files = filesOf(lines);
+    if (!quiet) {
+      if (!formats.length || patch) this.out(selected);
+      for (const format of formats) {
+        const rendered = format === "--name-only" ? files.map((f) => f.path).join("\n")
+          : format === "--name-status" ? files.map((f) => `${f.status}\t${f.path}`).join("\n")
+          : files.length ? statOf(lines, format) : "";
+        if (rendered) this.out(rendered + "\n");
+      }
+    }
+    return exitCode && selected.length ? 1 : 0;
   }
 
   noIndexDiff(files) {

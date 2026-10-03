@@ -1,0 +1,15 @@
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -5548,7 +5548,12 @@
+ static int
+ write2pipe(int pip[2], const char *p, size_t len)
+ {
++#ifdef __wasi__
++	/* The host pipe buffers the whole document before its reader runs. */
++	{
++#else
+ 	if (len <= PIPE_BUF) {
++#endif
+ 		xwrite(pip[1], p, len);
+ 		goto out;
+ 	}

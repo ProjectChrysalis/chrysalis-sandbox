@@ -19,10 +19,15 @@ QuickJS bundle and fflate from `node_modules`. The engine fetches the pinned rel
 
 ```
 bun run build:python   # once, before tests
-bun test
+bun run test
 ```
 
 Point the engine at a local checkout with `CHRYSALIS_SANDBOX_DIR=/path/to/repo`.
+
+Heredocs and here strings use buffered pipes at every size. Scripts larger
+than 4 KiB can run directly or be saved in `/tmp` for later commands.
+`git diff` accepts file paths with or without `--`, including staged diffs,
+patches, file lists and statistics from the workspace or a subdirectory.
 
 Git includes two-commit `merge-base` (`--all` and `--is-ancestor`) and
 `check-ignore` (`-v`, `-q`, `--stdin`, `-z`, `-n`, `--no-index`). Ignore

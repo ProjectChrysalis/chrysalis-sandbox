@@ -1,16 +1,16 @@
 {
   "name": "chrysalis-sandbox",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test",
+    "test": "bun test ./test",
     "build:busybox": "sh scripts/build-busybox.sh",
     "build:jq": "sh scripts/build-jq.sh",
     "build:python": "bun scripts/build-python.ts",
     "build:quickjs": "bun scripts/build-quickjs.ts",
     "pack": "bun scripts/pack.ts",
-    "release": "bun scripts/build-python.ts && bun test && bun scripts/pack.ts"
+    "release": "bun scripts/build-python.ts && bun run test && bun scripts/pack.ts"
   },
   "dependencies": {},
   "devDependencies": {
