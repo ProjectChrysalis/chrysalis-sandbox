@@ -1085,16 +1085,8 @@ export function makeTools({ store, net, shell }) {
     return 0;
   };
 
-  const timeout = (ctx) => {
-    const argv = ctx.args.slice();
-    while (argv[0]?.startsWith("-")) {
-      const a = argv.shift();
-      if (a === "-s" || a === "-k" || a === "--signal" || a === "--kill-after") argv.shift();
-    }
-    argv.shift(); // the duration: the sandbox's own per-command limit applies instead
-    if (!argv.length) return ctx.fail("timeout: missing operand", 125);
-    return shell.spawn(argv, { cwd: ctx.cwd, env: ctx.env, stdin: ctx.stdin, stdout: ctx.stdout, stderr: ctx.stderr });
-  };
+  const timeout = (ctx) => ctx.fail("timeout: per-process limits are unavailable. Set the embedder's command timeout instead; the command was not run.", 125);
+  const nohup = (ctx) => ctx.fail("nohup: detached processes are unavailable; the command was not run.", 125);
 
   return {
     which,
@@ -1114,7 +1106,7 @@ export function makeTools({ store, net, shell }) {
     chmod,
     ln,
     timeout,
-    nohup: timeout,
+    nohup,
     whoami: (ctx) => (ctx.print("sandbox\n"), 0),
     id: (ctx) => (ctx.print("uid=1000(sandbox) gid=1000(sandbox) groups=1000(sandbox)\n"), 0),
     hostname: (ctx) => (ctx.print("sandbox\n"), 0),

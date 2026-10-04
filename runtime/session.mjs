@@ -123,6 +123,9 @@ function exec(message) {
     stderr.push(`sandbox: ${(error && error.stack) || error}\n`);
     exitCode = 125;
   }
+  if (stderr.text().includes("can't fork: Function not implemented")) {
+    stderr.push("sandbox: process creation is unavailable. Replace <(...) or >(...) with temporary files, and avoid background jobs. The next command starts a fresh shell.\n");
+  }
   const { writes, deletes } = store.takeChanges();
   const workspaceWrites = [];
   const workspaceDeletes = [];

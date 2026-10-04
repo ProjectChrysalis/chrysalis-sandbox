@@ -40,6 +40,12 @@ without scanning the workspace. Whole-second `sleep` waits are honored;
 fractional durations are not enabled in this BusyBox build (use Python
 `time.sleep` when a script needs subsecond timing).
 
+Process substitution (`<(...)`, `>(...)`) and detached/background processes
+are unavailable. Compare temporary files instead. `timeout` and `nohup`
+return an explicit error without running the command. Use the embedder’s
+per-command timeout; it stops the worker and starts a fresh one for the next
+command, discarding unsaved changes and scratch files.
+
 ## Built with
 
 | Project | What it does here | License |
@@ -62,4 +68,4 @@ that is the license the combined work carries. Chrysalis Engine stays a
 separate program under its own license and drives this runtime through a
 worker boundary (`runtime/session.mjs`).
 
-The 0.4.1 release also provides [source and build materials](https://github.com/ProjectChrysalis/chrysalis-sandbox/releases/download/v0.4.1/sandbox-0.4.1-sources.zip): the release source tree, full pinned upstream GPL sources, configurations, patches and build scripts. The source archive has a separate `SOURCE_SHA256SUMS`; the runtime archive checksum is unchanged.
+The 0.4.3 release also provides [source and build materials](https://github.com/ProjectChrysalis/chrysalis-sandbox/releases/download/v0.4.3/sandbox-0.4.3-sources.zip): the release source tree, full pinned upstream GPL sources, configurations, patches and build scripts. The source archive has a separate `SOURCE_SHA256SUMS`; the runtime archive checksum is unchanged.

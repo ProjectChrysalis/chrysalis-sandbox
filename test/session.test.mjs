@@ -172,3 +172,24 @@ describe("network", () => {
     expect(r.out).toBe("POST\n1\na=1\nrc=22\n");
   });
 });
+
+test("unsupported process substitution cannot poison later shell instances", async () => {
+  for (let n = 0; n < 3; n++) {
+    const failed = await sb.run("diff <(echo a) <(echo b)");
+    expect(failed.code).toBe(2);
+    expect(failed.err).toContain("Replace <(...) or >(...) with temporary files");
+    const next = await sb.run("printf 'next\\n'; echo $(echo nested); printf 'a\\n' | cat");
+    expect(next).toMatchObject({ code: 0, out: "next\nnested\na\n", err: "" });
+  }
+  expect(await sb.run("printf a > /tmp/left; printf b > /tmp/right; diff /tmp/left /tmp/right")).toMatchObject({ code: 1 });
+});
+
+test("timeout and detached execution fail explicitly without running or discarding arguments", async () => {
+  for (const command of ["timeout 5 sleep 10", "timeout 1 touch never-created", "nohup touch never-created"]) {
+    const failed = await sb.run(command, { timeout: 1_000 });
+    expect(failed.code).toBe(125);
+    expect(failed.err).toContain("command was not run");
+    expect(sb.read("never-created")).toBeNull();
+    expect(await sb.run("echo recovered; echo $(echo nested)")).toMatchObject({ code: 0, out: "recovered\nnested\n", err: "" });
+  }
+});
