@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build
+        required: true
+        type: string
 
 jobs:
   build:
@@ -12,15 +18,24 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          bun -e 'const p = await Bun.file("package.json").json(); const s = await Bun.file("sources.json").json(); if (process.env.RELEASE_TAG !== `v${p.version}` || s.runtime.version !== p.version) throw new Error("Release tag and runtime versions differ");'
       - run: bun run build:python
+      - run: git config --global maintenance.auto false
       - run: bun run test
       - run: bun run pack
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           draft: true
           files: |
             sandbox-*.zip
