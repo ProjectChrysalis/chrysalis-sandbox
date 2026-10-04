@@ -15,12 +15,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun run build:python
-      - run: bun test
+      - run: bun run test
       - run: bun run pack
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             sandbox-*.zip
             SHA256SUMS
