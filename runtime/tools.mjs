@@ -12,7 +12,7 @@ const decoder = new TextDecoder();
 const JQ = "vendor/jq/jq.wasm";
 
 /** busybox applets in this build (busybox/busybox.config). */
-export const APPLETS = "ash awk base32 base64 basename bc cal cat cksum cmp comm cp crc32 cut date dc dd diff dirname dos2unix du echo egrep env expand expr factor false fgrep find fold getopt grep hd head hexdump install ls md5sum mkdir mktemp mv nl nproc od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum sha3sum sha512sum shuf sleep sort split stat strings stty sum tac tail tee test touch tr tree true truncate tsort uname unexpand uniq unix2dos unlink wc xargs xxd yes".split(" ");
+export const APPLETS = "ash awk base32 base64 basename bc cal cat cksum cmp comm cp crc32 cut date dc dd diff dirname dos2unix du echo egrep env expand expr factor false fgrep find fold getopt grep hd head hexdump install ls md5sum mkdir mktemp mv nl nproc od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum sha3sum sha512sum shuf sleep sort split stat strings stty sum tac tail tee test tr tree true truncate tsort uname unexpand uniq unix2dos unlink wc xargs xxd yes".split(" ");
 
 export function preloadTools() {
   return preloadWasm(JQ);
@@ -1085,6 +1085,69 @@ export function makeTools({ store, net, shell }) {
     return 0;
   };
 
+  // busybox's touch asks for "now" with a UTIME_NOW this libc does not
+  // share, so every plain `touch` failed with EINVAL; the applet is left out
+  // of the build and times are set on the store directly.
+  const touch = (ctx) => {
+    let access = false, modify = false, create = true, when = null;
+    const names = [];
+    const args = ctx.args;
+    const valueOf = (i, flag) => {
+      if (i + 1 >= args.length) throw new Error(`touch: option requires an argument -- '${flag}'`);
+      return args[i + 1];
+    };
+    try {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === "--") { names.push(...args.slice(i + 1)); break; }
+        if (a.startsWith("--date=")) { when = touchDate(a.slice(7)); continue; }
+        if (a.startsWith("--reference=")) { when = touchReference(ctx, a.slice(12)); continue; }
+        if (a === "--no-create") { create = false; continue; }
+        if (a === "-" || !a.startsWith("-")) { names.push(a); continue; }
+        for (let j = 1; j < a.length; j++) {
+          const flag = a[j];
+          if (flag === "a") access = true;
+          else if (flag === "m") modify = true;
+          else if (flag === "c") create = false;
+          else if (flag === "h" || flag === "f") continue;
+          else if (flag === "d" || flag === "r" || flag === "t") {
+            const rest = a.slice(j + 1);
+            const value = rest || valueOf(i, flag);
+            if (!rest) i++;
+            when = flag === "d" ? touchDate(value) : flag === "r" ? touchReference(ctx, value) : touchStamp(value);
+            break;
+          } else throw new Error(`touch: invalid option -- '${flag}'`);
+        }
+      }
+    } catch (error) {
+      return ctx.fail(error.message);
+    }
+    if (!names.length) return ctx.fail("touch: missing file operand");
+    if (!access && !modify) access = modify = true;
+    const ms = when ?? Date.now();
+    let failed = false;
+    for (const name of names) {
+      const path = ctx.resolve(name);
+      if (!exists(path)) {
+        if (!create) continue;
+        const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+        if (!isDir(parent)) {
+          ctx.stderr(encoder.encode(`touch: ${name}: No such file or directory\n`));
+          failed = true;
+          continue;
+        }
+        store.writeFile(path, new Uint8Array(0));
+      }
+      store.touchSync(path, { ...(access ? { atimeMs: ms } : {}), ...(modify ? { mtimeMs: ms } : {}) });
+    }
+    return failed ? 1 : 0;
+  };
+  const touchReference = (ctx, name) => {
+    const path = ctx.resolve(name);
+    if (!exists(path)) throw new Error(`touch: ${name}: No such file or directory`);
+    return store.statSync(path).mtimeMs;
+  };
+
   const timeout = (ctx) => ctx.fail("timeout: per-process limits are unavailable. Set the embedder's command timeout instead; the command was not run.", 125);
   const nohup = (ctx) => ctx.fail("nohup: detached processes are unavailable; the command was not run.", 125);
 
@@ -1105,6 +1168,7 @@ export function makeTools({ store, net, shell }) {
     file,
     chmod,
     ln,
+    touch,
     timeout,
     nohup,
     whoami: (ctx) => (ctx.print("sandbox\n"), 0),
@@ -1122,6 +1186,25 @@ export function makeTools({ store, net, shell }) {
 }
 
 // ------------------------------------------------------------ helpers
+
+/** A `touch -d` date: `@seconds`, or anything Date understands. */
+function touchDate(value) {
+  if (/^@-?\d+(\.\d+)?$/.test(value)) return Number(value.slice(1)) * 1000;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) throw new Error(`touch: invalid date '${value}'`);
+  return ms;
+}
+
+/** A `touch -t` stamp, [[CC]YY]MMDDhhmm[.ss], in local time. */
+function touchStamp(value) {
+  const m = /^(\d{2})?(\d{2})?(\d{2})(\d{2})(\d{2})(\d{2})(?:\.(\d{2}))?$/.exec(value);
+  if (!m) throw new Error(`touch: invalid date format '${value}'`);
+  const now = new Date();
+  let year = now.getFullYear();
+  if (m[1] !== undefined && m[2] !== undefined) year = Number(m[1] + m[2]);
+  else if (m[1] !== undefined) year = Number(m[1]) + (Number(m[1]) < 69 ? 2000 : 1900);
+  return new Date(year, Number(m[3]) - 1, Number(m[4]), Number(m[5]), Number(m[6]), Number(m[7] ?? 0)).getTime();
+}
 function concatBytes(chunks) {
   let total = 0;
   for (const c of chunks) total += c.length;

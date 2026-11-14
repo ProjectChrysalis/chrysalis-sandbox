@@ -123,6 +123,10 @@ const wasiErrno = (err) => WASI_ERRNO[err && err.code] ?? E.IO;
 const DEV_DEV = 2n;
 const DEV_DIR_INO = 1;
 const DEV_NULL = { read:()=>EMPTY, write:()=>{} };
+// Reads that never end: a caller takes what it asked for and stops.
+const DEV_READ_MAX = 65536;
+const DEV_ZERO = { read:(max)=>new Uint8Array(Math.min(max,DEV_READ_MAX)), write:()=>{} };
+const DEV_RANDOM = { read:(max)=>{ const a=new Uint8Array(Math.min(max,DEV_READ_MAX)); globalThis.crypto.getRandomValues(a); return a; }, write:()=>{} };
 // A device read answers with BYTES or with an ERRNO — the same two-shape
 // vocabulary its write already speaks (an errno to refuse, nothing to accept).
 // A number is an errno; anything else is data. Needed because a device that
@@ -166,6 +170,9 @@ export class WasiShim {
     this.devices = new Map();
     this.nextDevIno = DEV_DIR_INO + 1;
     this.addDevice('/dev/null', DEV_NULL);
+    this.addDevice('/dev/zero', DEV_ZERO);
+    this.addDevice('/dev/random', DEV_RANDOM);
+    this.addDevice('/dev/urandom', DEV_RANDOM);
     // Registered whether or not a port was handed over: "this session did not
     // grant it" (EPERM) and "this build has no port at all" (ENOENT) are
     // different answers, and a script can only act on the difference if the

@@ -193,3 +193,42 @@ test("timeout and detached execution fail explicitly without running or discardi
     expect(await sb.run("echo recovered; echo $(echo nested)")).toMatchObject({ code: 0, out: "recovered\nnested\n", err: "" });
   }
 });
+
+describe("touch, devices and git plumbing", () => {
+  test("touch creates, updates and sets times, alone and from children", async () => {
+    const t = new Sandbox({ "old.txt": "x\n" });
+    try {
+      let r = await t.run(": > empty.txt && touch empty.txt old.txt new.txt && ls");
+      expect(r.err).toBe("");
+      expect(r.out).toBe("empty.txt\nnew.txt\nold.txt\n");
+      r = await t.run("touch -t 202001021230 old.txt && touch -r old.txt new.txt && ls -l --full-time new.txt");
+      expect(r.out).toContain("2020-01-02 12:30:00");
+      r = await t.run("touch -c missing; ls missing 2>&1; touch no/dir/f; echo $?");
+      expect(r.out).toContain("No such file");
+      expect(r.out.trim().endsWith("1")).toBe(true);
+      r = await t.run("echo a b | xargs touch && sh -c 'touch c' && ls a b c");
+      expect(r.code).toBe(0);
+    } finally { t.close(); }
+  });
+
+  test("/dev/urandom and /dev/zero read", async () => {
+    const r = await sb.run("head -c 32 /dev/urandom | wc -c; head -c 4 /dev/zero | od -An -tx1");
+    expect(r.out.split("\n")[0].trim()).toBe("32");
+    expect(r.out).toContain("00 00 00 00");
+  });
+
+  test("reflog, symbolic-ref and count-objects answer", async () => {
+    const t = new Sandbox({ "f.txt": "1\n" });
+    try {
+      const g = "git -c user.name=a -c user.email=a@b";
+      let r = await t.run(`git init -q && git add -A && ${g} commit -qm one && echo 2 >> f.txt && ${g} commit -qam two && git reflog`);
+      expect(r.code).toBe(0);
+      expect(r.out).toMatch(/^[0-9a-f]{7} HEAD@\{0\}: commit: two\n[0-9a-f]{7} HEAD@\{1\}: commit \(initial\): one\n$/);
+      r = await t.run("git symbolic-ref HEAD; git symbolic-ref --short HEAD; git count-objects -v");
+      expect(r.out).toContain("refs/heads/main\nmain\ncount: ");
+      expect(r.out).toContain("in-pack: ");
+      r = await t.run("git switch -q --detach HEAD && git symbolic-ref -q HEAD; echo $?");
+      expect(r.out.trim()).toBe("1");
+    } finally { t.close(); }
+  });
+});

@@ -33,12 +33,16 @@ Git includes two-commit `merge-base` (`--all` and `--is-ancestor`) and
 `check-ignore` (`-v`, `-q`, `--stdin`, `-z`, `-n`, `--no-index`). Ignore
 checks use the repository's index, `.gitignore` files, `.git/info/exclude`
 and its configured `core.excludesFile`, all inside the virtual filesystem.
-Other merge-base modes are refused explicitly. The shell remains busybox
+Other merge-base modes are refused explicitly. `reflog`, `symbolic-ref` and
+`count-objects` read the repository directly. The shell remains busybox
 ash; GNU-only options are not universal (use `ls -l --full-time` for full
 timestamps). `rg` searches piped or redirected input, or explicit `-`,
 without scanning the workspace. Whole-second `sleep` waits are honored;
 fractional durations are not enabled in this BusyBox build (use Python
 `time.sleep` when a script needs subsecond timing).
+
+`/dev/zero`, `/dev/random` and `/dev/urandom` read as expected. `touch`
+is the runtime's own, so it works from `xargs` and `find -exec` too.
 
 Process substitution (`<(...)`, `>(...)`) and detached/background processes
 are unavailable. Compare temporary files instead. `timeout` and `nohup`

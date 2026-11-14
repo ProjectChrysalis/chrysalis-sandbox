@@ -1291,6 +1291,86 @@ class Git {
     return found ? 0 : 1;
   }
 
+  cmd_symbolic_ref(args) {
+    const quiet = args.includes("-q") || args.includes("--quiet");
+    const short = args.includes("--short");
+    if (args.some((a) => a === "-d" || a === "--delete")) return this.fatal("refusing to delete a symbolic ref here; switch branches instead");
+    const words = args.filter((a) => !a.startsWith("-"));
+    const name = words[0];
+    if (!name || words.length > 2) return this.fatal("usage: git symbolic-ref [-q] [--short] <name> [<ref>]", 129);
+    const file = `${this.repo.gitDir}/${name}`;
+    if (words.length === 2) {
+      if (!words[1].startsWith("refs/")) return this.fatal(`Refusing to point ${name} outside of refs/`);
+      this.store.writeFile(file, encoder.encode(`ref: ${words[1]}\n`));
+      return 0;
+    }
+    const raw = text(this.store.readFile(file) ?? new Uint8Array()).trim();
+    if (!raw.startsWith("ref: ")) {
+      if (quiet) return 1;
+      return this.fatal(`ref ${name} is not a symbolic ref`);
+    }
+    const ref = raw.slice(5);
+    this.out(`${short ? ref.replace(/^refs\/(heads|tags|remotes)\//, "") : ref}\n`);
+    return 0;
+  }
+
+  cmd_count_objects(args) {
+    const verbose = args.includes("-v") || args.includes("--verbose");
+    const human = args.includes("-H") || args.includes("--human-readable");
+    const objects = `${this.repo.gitDir}/objects`;
+    let count = 0, bytes = 0, packs = 0, packBytes = 0, inPack = 0;
+    for (const file of this.store.walk(objects)) {
+      const rel = file.slice(objects.length + 1);
+      if (/^[0-9a-f]{2}\/[0-9a-f]{38}$/.test(rel)) {
+        count++;
+        bytes += this.store.statSync(file).size;
+      } else if (/^pack\/pack-[0-9a-f]+\.pack$/.test(rel)) {
+        packs++;
+        packBytes += this.store.statSync(file).size;
+        const idx = this.store.readFile(file.replace(/\.pack$/, ".idx"));
+        // v2 index: magic, version, then 256 fan-out counts; the last is the total
+        if (idx && idx.length >= 8 + 256 * 4) inPack += new DataView(idx.buffer, idx.byteOffset, idx.byteLength).getUint32(8 + 255 * 4);
+      }
+    }
+    const size = (n) => (human ? humanBytes(n) : String(Math.ceil(n / 1024)));
+    if (!verbose) {
+      this.out(human ? `${count} objects, ${size(bytes)}\n` : `${count} objects, ${size(bytes)} kilobytes\n`);
+      return 0;
+    }
+    this.out(`count: ${count}\nsize: ${size(bytes)}\nin-pack: ${inPack}\npacks: ${packs}\nsize-pack: ${size(packBytes)}\nprune-packable: 0\ngarbage: 0\nsize-garbage: ${size(0)}\n`);
+    return 0;
+  }
+
+  cmd_reflog(args) {
+    const rest = args.slice();
+    if (rest[0] === "show") rest.shift();
+    else if (rest[0] && ["expire", "delete", "exists"].includes(rest[0])) {
+      if (rest[0] !== "exists") return this.fatal(`'reflog ${rest[0]}' is not available in this sandbox's git`, 1);
+      return this.store.readFile(`${this.repo.gitDir}/logs/${rest[1] ?? "HEAD"}`) ? 0 : 1;
+    }
+    let limit = Infinity;
+    const words = [];
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      const n = /^-n?(\d+)$/.exec(a) ?? /^--max-count=(\d+)$/.exec(a);
+      if (n) limit = Number(n[1]);
+      else if (a === "-n") limit = Number(rest[++i]);
+      else if (!a.startsWith("-")) words.push(a);
+    }
+    let ref = words[0] ?? "HEAD";
+    if (ref !== "HEAD" && !ref.startsWith("refs/")) ref = `refs/heads/${ref}`;
+    const log = this.store.readFile(`${this.repo.gitDir}/logs/${ref}`);
+    if (!log && ref !== "HEAD") return this.fatal(`ambiguous argument '${words[0]}': unknown revision or path not in the working tree.`);
+    const shown = words[0] ?? "HEAD";
+    const entries = text(log ?? new Uint8Array()).split("\n").filter(Boolean).reverse();
+    entries.slice(0, limit).forEach((line, i) => {
+      const [head, message = ""] = line.split("\t");
+      const sha = head.split(" ")[1] ?? "";
+      this.out(`${sha.slice(0, 7)} ${shown}@{${i}}: ${message}\n`);
+    });
+    return 0;
+  }
+
   cmd_ls_tree(args) {
     const recursive = args.includes("-r");
     const nameOnly = args.includes("--name-only") || args.includes("--name-status");
@@ -1446,6 +1526,14 @@ function concatBytes(chunks) {
 }
 
 /** lg2's stderr, minus its progress chatter and example-program noise. */
+function humanBytes(n) {
+  if (n < 1024) return `${n} bytes`;
+  const units = ["KiB", "MiB", "GiB"];
+  let v = n / 1024, u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return `${v.toFixed(2)} ${units[u]}`;
+}
+
 function cleanErr(s) {
   if (!s) return "";
   return s
@@ -1629,5 +1717,5 @@ Working with files:  status, add [-A|-u], rm, mv, restore [--staged], reset, cle
 History:             commit [-a] [-m], log [--oneline|--format=|-p|--stat], show, blame, grep, ls-files, ls-tree
 Branches:            branch, switch [-c], checkout [-b], merge, tag, stash
 Remotes:             clone, fetch, pull, push, remote
-Plumbing:            rev-parse, rev-list, merge-base, check-ignore, cat-file, for-each-ref, show-ref, config, describe
+Plumbing:            rev-parse, rev-list, merge-base, check-ignore, cat-file, for-each-ref, show-ref, symbolic-ref, reflog, count-objects, config, describe
 `;
