@@ -1,0 +1,36 @@
+--- a/build/shim/wasistubs.c
++++ b/build/shim/wasistubs.c
+@@ -284,17 +284,31 @@
+ ssize_t __wrap_read(int fd, void *buf, size_t n){ bb_intr_check(); return __real_read(fd, buf, n); }
+ extern ssize_t __real_readv(int, const struct iovec *, int);
+ ssize_t __wrap_readv(int fd, const struct iovec *v, int c){ bb_intr_check(); return __real_readv(fd, v, c); }
++/* EPIPE ends an applet immediately; shell writers stop at the next node. */
++int bb_sigpipe;
++static ssize_t pipe_wrote(ssize_t r){
++  if (r < 0 && errno == EPIPE) {
++    if (intr_depth && !intr_quiet && die_func) {
++      intr_quiet = 1;
++      intr_partial = 0;
++      xfunc_error_retval = 141;
++      die_func();
++    }
++    bb_sigpipe = 1;
++  }
++  return r;
++}
+ extern ssize_t __real_write(int, const void *, size_t);
+ ssize_t __wrap_write(int fd, const void *buf, size_t n){
+   if (!intr_partial) bb_intr_check();
+-  return intr_wrote(__real_write(fd, buf, n), n);
++  return pipe_wrote(intr_wrote(__real_write(fd, buf, n), n));
+ }
+ extern ssize_t __real_writev(int, const struct iovec *, int);
+ ssize_t __wrap_writev(int fd, const struct iovec *v, int c){
+   size_t want = 0; int i;
+   if (!intr_partial) bb_intr_check();
+   for (i = 0; i < c; i++) want += v[i].iov_len;
+-  return intr_wrote(__real_writev(fd, v, c), want);
++  return pipe_wrote(intr_wrote(__real_writev(fd, v, c), want));
+ }
+ 
+ /* sed -i and mktemp need mkstemp; emulate with O_CREAT|O_EXCL retries

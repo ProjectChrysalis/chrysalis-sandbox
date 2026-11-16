@@ -1,0 +1,25 @@
+--- a/build/shim/wasistubs.c
++++ b/build/shim/wasistubs.c
+@@ -40,9 +40,19 @@
+ int execvp(const char*f,char*const a[]){ (void)f;(void)a; errno=ENOSYS; return -1; }
+ int execv(const char*f,char*const a[]){ (void)f;(void)a; errno=ENOSYS; return -1; }
+ int execve(const char*f,char*const a[],char*const e[]){ (void)f;(void)a;(void)e; errno=ENOSYS; return -1; }
+-struct rlimit; 
+-int getrlimit(int r, struct rlimit *l){ (void)r;(void)l; return 0; }
+-int setrlimit(int r, const struct rlimit *l){ (void)r;(void)l; return 0; }
++/* No per-resource quotas exist inside an instance. Never return an
++ * uninitialized limit or claim that a requested quota was installed. */
++int getrlimit(int r, struct rlimit *l){
++  if (r < 0 || r >= RLIM_NLIMITS) { errno=EINVAL; return -1; }
++  l->rlim_cur=l->rlim_max=RLIM_INFINITY;
++  return 0;
++}
++int setrlimit(int r, const struct rlimit *l){
++  if (r < 0 || r >= RLIM_NLIMITS) { errno=EINVAL; return -1; }
++  if (l->rlim_cur == RLIM_INFINITY && l->rlim_max == RLIM_INFINITY) return 0;
++  errno=ENOSYS;
++  return -1;
++}
+ /* process/permission/misc stubs (browser: no users, no exec) */
+ unsigned getuid(void){ return 0; } unsigned geteuid(void){ return 0; }
+ unsigned getgid(void){ return 0; } unsigned getegid(void){ return 0; }

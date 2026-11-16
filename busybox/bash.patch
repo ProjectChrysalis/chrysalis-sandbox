@@ -1,0 +1,4470 @@
+--- a/coreutils/echo.c
++++ b/coreutils/echo.c
+@@ -187,7 +187,7 @@
+ 	/* Careful to error out on partial writes too (think ENOSPC!) */
+ 	errno = 0;
+ 	err = full_write(STDOUT_FILENO, buffer, out - buffer) != out - buffer;
+-	if (err) {
++	if (err && errno != EPIPE) {
+ 		bb_simple_perror_msg(bb_msg_write_error);
+ 	}
+ 	free(buffer);
+--- a/coreutils/printf.c
++++ b/coreutils/printf.c
+@@ -287,6 +287,42 @@
+ 
+ /* Print the text in FORMAT, using ARGV for arguments to any '%' directives.
+    Return advanced ARGV.  */
++/* %q: the argument quoted so the shell reads it back unchanged. */
++static void print_shell_quoted(const char *s)
++{
++	const char *p;
++
++	if (!*s) {
++		fputs("''", stdout);
++		return;
++	}
++	for (p = s; *p; p++)
++		if ((unsigned char)*p < 0x20 || *p == 0x7f)
++			break;
++	if (*p) {
++		fputs("$'", stdout);
++		for (p = s; *p; p++) {
++			unsigned char c = *p;
++			if (c == '\n') fputs("\\n", stdout);
++			else if (c == '\t') fputs("\\t", stdout);
++			else if (c == '\r') fputs("\\r", stdout);
++			else if (c == 0x1b) fputs("\\E", stdout);
++			else if (c == '\\' || c == '\'') { putchar('\\'); putchar(c); }
++			else if (c < 0x20 || c == 0x7f) printf("\\%03o", c);
++			else putchar(c);
++		}
++		putchar('\'');
++		return;
++	}
++	for (p = s; *p; p++) {
++		if (!isalnum((unsigned char)*p) && !((unsigned char)*p & 0x80)
++		 && !strchr("_./:=+@%,-", *p)
++		)
++			putchar('\\');
++		putchar(*p);
++	}
++}
++
+ static char **print_formatted(char *f, char **argv, int *conv_err)
+ {
+ 	char *direc_start;      /* Start of % directive.  */
+@@ -303,6 +339,10 @@
+ 			field_width = precision = 0;
+ 			if (*f == '%') {
+ 				bb_putchar('%');
++				break;
++			}
++			if (*f == 'q') {
++				print_shell_quoted(*argv ? *argv++ : "");
+ 				break;
+ 			}
+ 			if (*f == 'b') {
+--- a/coreutils/test.c
++++ b/coreutils/test.c
+@@ -598,7 +598,13 @@
+ 				/* Bad regex */
+ 				longjmp(leaving, 2); /* [[ a =~ * ]]; echo $? - prints 2 (silently, no error msg) */
+ 			}
+-			val1 = regexec(&re_buffer, opnd1, 0, NULL, 0);
++			{
++				extern void test_rematch(const char *s, const regmatch_t *m, int n);
++				regmatch_t m[10];
++				int nm = re_buffer.re_nsub + 1 < 10 ? re_buffer.re_nsub + 1 : 10;
++				val1 = regexec(&re_buffer, opnd1, nm, m, 0);
++				test_rematch(opnd1, val1 == 0 ? m : NULL, nm);
++			}
+ 			regfree(&re_buffer);
+ 			return val1 == 0;
+ 		}
+--- a/findutils/xargs.c
++++ b/findutils/xargs.c
+@@ -176,7 +176,8 @@
+ 	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   "0") \
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    "I:i::") \
+ 	IF_FEATURE_XARGS_SUPPORT_PARALLEL(    "P:+") \
+-	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:")
++	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:") \
++	IF_NOT_FEATURE_XARGS_SUPPORT_PARALLEL("P:")
+ 
+ 
+ /*
+@@ -625,6 +626,7 @@
+ #define read_args process_stdin
+ #endif
+ 	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(char *opt_a = NULL;)
++	IF_NOT_FEATURE_XARGS_SUPPORT_PARALLEL(char *opt_P = NULL;)
+ 
+ 	INIT_G();
+ 
+@@ -634,6 +636,7 @@
+ 		IF_FEATURE_XARGS_SUPPORT_REPL_STR(, &G.repl_str, &G.repl_str)
+ 		IF_FEATURE_XARGS_SUPPORT_PARALLEL(, &G.max_procs)
+ 		IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(, &opt_a)
++		IF_NOT_FEATURE_XARGS_SUPPORT_PARALLEL(, &opt_P)
+ 	);
+ 
+ #if ENABLE_FEATURE_XARGS_SUPPORT_PARALLEL
+--- a/libbb/time.c
++++ b/libbb/time.c
+@@ -8,12 +8,105 @@
+  */
+ #include "libbb.h"
+ 
++/* Relative dates counted from now: "now", "today", "yesterday",
++ * "tomorrow", "N unit [ago]", "+N unit", "next unit", "last unit", in any
++ * sequence. Units: second, minute, hour, day, week, fortnight, month, year
++ * (singular, plural or abbreviated as sec/min). */
++static int parse_relative(const char *s, struct tm *ptm)
++{
++	static const char units[] ALIGN1 =
++		"sec\0second\0min\0minute\0hour\0day\0week\0fortnight\0month\0year\0";
++	time_t now = time(NULL);
++	struct tm tm;
++	int matched = 0;
++
++	localtime_r(&now, &tm);
++	for (;;) {
++		char word[16];
++		long n = 1;
++		int len, idx;
++
++		s = skip_whitespace(s);
++		if (!*s)
++			break;
++		if (*s == '+' || *s == '-' || isdigit((unsigned char)*s)) {
++			char *e;
++			n = strtol(s, &e, 10);
++			if (e == s || (e == s + 1 && !isdigit((unsigned char)*s)))
++				return 0;
++			s = skip_whitespace(e);
++		}
++		len = 0;
++		while (isalpha((unsigned char)s[len]) && len < 15) {
++			word[len] = tolower((unsigned char)s[len]);
++			len++;
++		}
++		if (isalpha((unsigned char)s[len]))
++			return 0;
++		word[len] = '\0';
++		s += len;
++		if (!len)
++			return 0;
++		if (strcmp(word, "now") == 0 || strcmp(word, "today") == 0) {
++			matched = 1;
++			continue;
++		}
++		if (strcmp(word, "yesterday") == 0 || strcmp(word, "tomorrow") == 0) {
++			tm.tm_mday += word[0] == 'y' ? -1 : 1;
++			matched = 1;
++			continue;
++		}
++		if (strcmp(word, "next") == 0 || strcmp(word, "last") == 0) {
++			n = word[0] == 'n' ? 1 : -1;
++			s = skip_whitespace(s);
++			len = 0;
++			while (isalpha((unsigned char)s[len]) && len < 15) {
++				word[len] = tolower((unsigned char)s[len]);
++				len++;
++			}
++			word[len] = '\0';
++			s += len;
++		}
++		if (len > 1 && word[len - 1] == 's')
++			word[--len] = '\0';
++		idx = index_in_strings(units, word);
++		if (idx < 0)
++			return 0;
++		s = skip_whitespace(s);
++		if (strncasecmp(s, "ago", 3) == 0 && !isalpha((unsigned char)s[3])) {
++			n = -n;
++			s += 3;
++		}
++		switch (idx) {
++		case 0: case 1: tm.tm_sec += n; break;
++		case 2: case 3: tm.tm_min += n; break;
++		case 4: tm.tm_hour += n; break;
++		case 5: tm.tm_mday += n; break;
++		case 6: tm.tm_mday += 7 * n; break;
++		case 7: tm.tm_mday += 14 * n; break;
++		case 8: tm.tm_mon += n; break;
++		default: tm.tm_year += n; break;
++		}
++		matched = 1;
++	}
++	if (!matched)
++		return 0;
++	tm.tm_isdst = -1;
++	if (mktime(&tm) == (time_t)-1)
++		return 0;
++	*ptm = tm;
++	return 1;
++}
++
+ /* Returns 0 if the time structure contains an absolute UTC time which
+  * should not be subject to DST adjustment by the caller. */
+ int FAST_FUNC parse_datestr(const char *date_str, struct tm *ptm)
+ {
+ 	char end = '\0';
+ 	time_t t;
++
++	if (parse_relative(date_str, ptm))
++		return 1;
+ #if ENABLE_DESKTOP
+ /*
+  * strptime is BIG: ~1k in uclibc, ~10k in glibc
+--- a/libbb/vfork_daemon_rexec.c
++++ b/libbb/vfork_daemon_rexec.c
+@@ -112,6 +112,7 @@
+ 	int rc, argc;
+ 	volatile unsigned depth; /* survives die_func's longjmp */
+ 	struct nofork_save_area old;
++	char *volatile caller_buf = NULL;
+ 
+ 	save_nofork_data(&old);
+ 	/* wasi-sh: from here to bb_intr_leave() below, a ^C posted by the host
+@@ -131,6 +132,8 @@
+ 	argc = string_array_len(argv);
+ 
+ 	/* If xfunc "dies" in NOFORK applet, die_func longjmp's here instead */
++	if (nofork_depth)
++		caller_buf = xmemdup(bb_common_bufsiz1, COMMON_BUFSIZE);
+ 	memset(bb_common_bufsiz1, 0, COMMON_BUFSIZE);
+ 	clearerr(stdin); clearerr(stdout); clearerr(stderr);
+ 	depth = ++nofork_depth;
+@@ -180,6 +183,10 @@
+ 
+ 	/* Restoring some globals */
+ 	restore_nofork_data(&old);
++	if (caller_buf) {
++		memcpy(bb_common_bufsiz1, caller_buf, COMMON_BUFSIZE);
++		free(caller_buf);
++	}
+ 	/* Other globals can be simply reset to defaults */
+ 	GETOPT_RESET();
+ 
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -204,6 +204,7 @@
+ #define JOBS ENABLE_ASH_JOB_CONTROL
+ 
+ #include <fnmatch.h>
++#include <regex.h>
+ #include <sys/times.h>
+ #include <sys/utsname.h> /* for setting $HOSTNAME */
+ #include "busybox.h" /* for applet_names */
+@@ -926,6 +927,10 @@
+ #define VSREPLACE       0xc     /* ${var/pattern/replacement} */
+ #define VSREPLACEALL    0xd     /* ${var//pattern/replacement} */
+ #endif
++#define VSCASE          0xe     /* ${var^}, ${var,,}, ${var@Q}: op chars lead the word */
++#define VSRAW           0xf     /* text kept as written, parsed when used (rawword()) */
++#define VSSUBSCR        0x20    /* ${name[sub]...}: raw subscript, CTLENDVAR, then the op word */
++#define VSINDIR         0x40    /* ${!name...} */
+ #if DEBUG || JOBS
+ static const char vstype_suffix[][3] ALIGN1 = {
+ 	[VSNORMAL       - VSNORMAL] = "}", // $var or ${var}
+@@ -945,6 +950,8 @@
+ 	[VSREPLACE      - VSNORMAL] = "/", // ${var/pattern/replacement}
+ 	[VSREPLACEALL   - VSNORMAL] = "//",// ${var//pattern/replacement}
+ # endif
++	[VSCASE         - VSNORMAL] = "",
++	[VSRAW          - VSNORMAL] = "",
+ };
+ #endif
+ 
+@@ -1628,12 +1635,9 @@
+ 	if (e != ENOENT && e != ENOTDIR)
+ 		return strerror(e);
+ 
+-	if (action & E_OPEN)
+-		return "no such file";
+-	else if (action & E_CREAT)
+-		return "nonexistent directory";
+-	else
+-		return "not found";
++	if (action & E_EXEC)
++		return "command not found";
++	return "No such file or directory";
+ }
+ 
+ static int sh_open_fail(const char *, int, int) NORETURN;
+@@ -1649,7 +1653,8 @@
+ 		action = E_CREAT;
+ 	}
+ 
+-	ash_msg_and_raise_error("can't %s %s: %s", word, pathname, errmsg(e, action));
++	(void)word;
++	ash_msg_and_raise_error("%s: %s", pathname, errmsg(e, action));
+ }
+ 
+ static int sh_open(const char *pathname, int flags, int mayfail)
+@@ -2231,12 +2236,15 @@
+ static void FAST_FUNC getoptsreset(const char *value);
+ #endif
+ 
++struct arr;
++
+ struct var {
+ 	struct var *next;               /* next entry in hash list */
+ 	int flags;                      /* flags are defined above */
+ 	const char *var_text;           /* name=value */
+ 	void (*var_func)(const char *) FAST_FUNC; /* function to be called when  */
+ 					/* the variable gets set/unset */
++	struct arr *arr;                /* array elements; var_text mirrors element 0 */
+ };
+ 
+ struct localvar {
+@@ -2244,6 +2252,7 @@
+ 	struct var *vp;                 /* the variable that was made local */
+ 	int flags;                      /* saved flags */
+ 	const char *text;               /* saved text */
++	struct arr *arr;                /* saved elements */
+ };
+ 
+ /* flags */
+@@ -2261,6 +2270,13 @@
+ #else
+ # define VDYNAMIC       0
+ #endif
++#define VARRAY          0x400   /* indexed array */
++#define VASSOC          0x800   /* associative array */
++#define VARRSYNC        0x1000  /* setvareq: only mirror element 0, never stored */
++#define VINTEGER        0x2000  /* declare -i */
++#define VLOWER          0x4000  /* declare -l */
++#define VUPPER          0x8000  /* declare -u */
++#define VATTRS          (VARRAY|VASSOC|VINTEGER|VLOWER|VUPPER)
+ 
+ /* Need to be before varinit_data[] */
+ #if ENABLE_LOCALE_SUPPORT
+@@ -2287,6 +2303,7 @@
+ #if BASH_EPOCH_VARS
+ static void change_seconds(const char *) FAST_FUNC;
+ static void change_realtime(const char *) FAST_FUNC;
++static void change_shellsecs(const char *) FAST_FUNC;
+ #endif
+ 
+ static const struct {
+@@ -2318,6 +2335,7 @@
+ #if BASH_EPOCH_VARS
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET|VDYNAMIC, "EPOCHSECONDS", change_seconds },
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET|VDYNAMIC, "EPOCHREALTIME", change_realtime },
++	{ VSTRFIXED|VTEXTFIXED|VDYNAMIC, "SECONDS", change_shellsecs },
+ #endif
+ #if ENABLE_LOCALE_SUPPORT
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET, "LC_ALL"    , change_lc_all   },
+@@ -2379,6 +2397,7 @@
+ #if BASH_EPOCH_VARS
+ # define vepochs  varinit[VAR_OFFSET3 + 7]
+ # define vepochr  varinit[VAR_OFFSET3 + 8]
++# define vshsecs  varinit[VAR_OFFSET3 + 9]
+ #endif
+ #define INIT_G_var() do { \
+ 	unsigned i; \
+@@ -2549,6 +2568,144 @@
+ 	return lookupvar(name);
+ }
+ 
++/* ---- arrays ----
++ * Elements hang off the variable and are shared copy-on-write, so saving a
++ * variable for a function or subshell costs a reference, not a copy. Indexed
++ * arrays keep their elements sorted by index, associative ones in insertion
++ * order. var_text always holds element 0, which is what $name reads. */
++struct arrent {
++	arith_t idx;
++	char *key;
++	char *val;
++};
++struct arr {
++	int ref, n, cap;
++	struct arrent *e;
++};
++
++static void
++arr_release(struct arr *a)
++{
++	int i;
++
++	if (!a || --a->ref > 0)
++		return;
++	for (i = 0; i < a->n; i++) {
++		free(a->e[i].key);
++		free(a->e[i].val);
++	}
++	free(a->e);
++	free(a);
++}
++
++/* index of the element, or -(insertion point)-1 */
++static int
++arr_pos(struct arr *a, int assoc, const char *key, arith_t idx)
++{
++	int lo, hi;
++
++	if (!a)
++		return -1;
++	if (assoc) {
++		for (lo = 0; lo < a->n; lo++)
++			if (strcmp(a->e[lo].key, key) == 0)
++				return lo;
++		return -a->n - 1;
++	}
++	lo = 0;
++	hi = a->n - 1;
++	while (lo <= hi) {
++		int mid = (lo + hi) / 2;
++		if (a->e[mid].idx == idx)
++			return mid;
++		if (a->e[mid].idx < idx)
++			lo = mid + 1;
++		else
++			hi = mid - 1;
++	}
++	return -lo - 1;
++}
++
++static void
++arr_put(struct arr *a, int assoc, const char *key, arith_t idx, const char *val)
++{
++	int i = arr_pos(a, assoc, key, idx);
++
++	if (i >= 0) {
++		char *v = ckstrdup(val);
++		free(a->e[i].val);
++		a->e[i].val = v;
++		return;
++	}
++	i = -i - 1;
++	if (a->n >= a->cap) {
++		a->cap = a->cap * 2 + 8;
++		a->e = ckrealloc(a->e, a->cap * sizeof(a->e[0]));
++	}
++	memmove(&a->e[i + 1], &a->e[i], (a->n - i) * sizeof(a->e[0]));
++	a->e[i].idx = idx;
++	a->e[i].key = assoc ? ckstrdup(key) : NULL;
++	a->e[i].val = ckstrdup(val);
++	a->n++;
++}
++
++static void
++arr_del(struct arr *a, int assoc, const char *key, arith_t idx)
++{
++	int i = arr_pos(a, assoc, key, idx);
++
++	if (i < 0)
++		return;
++	free(a->e[i].key);
++	free(a->e[i].val);
++	a->n--;
++	memmove(&a->e[i], &a->e[i + 1], (a->n - i) * sizeof(a->e[0]));
++}
++
++/* The variable's own copy of its elements, made an array if it was not. */
++static struct arr *
++arr_own(struct var *vp)
++{
++	struct arr *a = vp->arr;
++
++	if (!a) {
++		a = ckzalloc(sizeof(*a));
++		a->ref = 1;
++		vp->arr = a;
++		if (!(vp->flags & VUNSET))
++			arr_put(a, vp->flags & VASSOC, "0", 0, strchrnul(vp->var_text, '=')[0] ? strchr(vp->var_text, '=') + 1 : "");
++	} else if (a->ref > 1) {
++		struct arr *c = ckzalloc(sizeof(*c));
++		int i;
++
++		c->ref = 1;
++		c->n = c->cap = a->n;
++		c->e = ckmalloc((a->n + 1) * sizeof(c->e[0]));
++		for (i = 0; i < a->n; i++) {
++			c->e[i].idx = a->e[i].idx;
++			c->e[i].key = a->e[i].key ? ckstrdup(a->e[i].key) : NULL;
++			c->e[i].val = ckstrdup(a->e[i].val);
++		}
++		a->ref--;
++		vp->arr = a = c;
++	}
++	if (!(vp->flags & VASSOC))
++		vp->flags |= VARRAY;
++	return a;
++}
++
++/* A plain assignment to an array sets element 0. */
++static void
++arr_set0(struct var *vp, const char *val)
++{
++	int assoc = vp->flags & VASSOC;
++	int i = arr_pos(vp->arr, assoc, "0", 0);
++
++	if (i >= 0 && strcmp(vp->arr->e[i].val, val) == 0)
++		return;
++	arr_put(arr_own(vp), assoc, "0", 0, val);
++}
++
+ /*
+  * Same as setvar except that the variable and value are passed in
+  * the first argument as name=value.  Since the first argument will
+@@ -2560,7 +2717,9 @@
+ setvareq(char *s, int flags)
+ {
+ 	struct var *vp, **vpp;
+-
++	int sync = flags & VARRSYNC;
++
++	flags &= ~VARRSYNC;
+ 	flags |= (VEXPORT & (((unsigned) (1 - aflag)) - 1));
+ 	vpp = findvar(s);
+ 	vp = *vpp;
+@@ -2580,6 +2739,13 @@
+ 
+ 		if (vp->var_func && !(flags & VNOFUNC))
+ 			vp->var_func(var_end(s));
++
++		if (flags & VUNSET) {
++			arr_release(vp->arr);
++			vp->arr = NULL;
++		} else if (vp->arr && !sync) {
++			arr_set0(vp, var_end(s));
++		}
+ 
+ 		if (!(vp->flags & (VTEXTFIXED|VSTACK)))
+ 			free((char*)vp->var_text);
+@@ -2594,6 +2760,8 @@
+ 		}
+ 
+ 		flags |= vp->flags & ~(VTEXTFIXED|VSTACK|VNOSAVE|VUNSET);
++		if (flags & VUNSET)
++			flags &= ~VATTRS;
+ #if ENABLE_ASH_RANDOM_SUPPORT || BASH_EPOCH_VARS
+ 		if (flags & VUNSET)
+ 			flags &= ~VDYNAMIC;
+@@ -2671,6 +2839,304 @@
+ {
+ 	setvar(s, NULL, 0);
+ }
++
++#if ENABLE_FEATURE_SH_MATH
++static arith_t ash_arith(const char *s);
++#endif
++
++static void
++arr_sync(struct var *vp)
++{
++	int nlen = strchrnul(vp->var_text, '=') - vp->var_text;
++	int i = arr_pos(vp->arr, vp->flags & VASSOC, "0", 0);
++	const char *v = i >= 0 ? vp->arr->e[i].val : "";
++	char *s = ckmalloc(nlen + strlen(v) + 2);
++
++	memcpy(s, vp->var_text, nlen);
++	s[nlen] = '=';
++	strcpy(s + nlen + 1, v);
++	setvareq(s, VNOSAVE | VARRSYNC);
++}
++
++/* The key of an associative array, else an arithmetic index; a negative
++ * index counts back from the end. Returns nonzero for a key. */
++static int
++arr_index(struct var *vp, const char *sub, const char **key, arith_t *idx)
++{
++	*key = sub;
++	*idx = 0;
++	if (vp && (vp->flags & VASSOC))
++		return 1;
++	*idx = ash_arith(sub);
++	if (*idx < 0) {
++		arith_t top = -1;
++		if (vp && vp->arr) {
++			if (vp->arr->n)
++				top = vp->arr->e[vp->arr->n - 1].idx;
++		} else if (vp && !(vp->flags & VUNSET))
++			top = 0;
++		*idx += top + 1;
++		if (*idx < 0)
++			ash_msg_and_raise_error("%s: bad array subscript", sub);
++	}
++	return 0;
++}
++
++/* A new, empty array variable. */
++static struct var *
++arr_new(const char *name)
++{
++	struct var *vp = setvar(name, "", 0);
++	struct arr *a = ckzalloc(sizeof(*a));
++
++	a->ref = 1;
++	vp->arr = a;
++	vp->flags |= VARRAY;
++	return vp;
++}
++
++static int
++arr_is0(int assoc, const char *key, arith_t idx)
++{
++	return assoc ? strcmp(key, "0") == 0 : idx == 0;
++}
++
++static const char *
++arr_get(const char *name, const char *sub)
++{
++	struct var *vp = *findvar(name);
++	const char *key;
++	arith_t idx;
++	int assoc = arr_index(vp, sub, &key, &idx), i;
++
++	vp = *findvar(name);
++	if (!vp)
++		return NULL;
++	if (!vp->arr)
++		return arr_is0(assoc, key, idx) ? lookupvar(name) : NULL;
++	i = arr_pos(vp->arr, assoc, key, idx);
++	return i >= 0 ? vp->arr->e[i].val : NULL;
++}
++
++/* The value a declare -i/-l/-u variable stores for an assignment. */
++static char *
++attr_value(int flags, const char *old, const char *val, int append)
++{
++	char *s;
++
++#if ENABLE_FEATURE_SH_MATH
++	if (flags & VINTEGER) {
++		arith_t v = ash_arith(val);
++		if (append && old)
++			v += ash_arith(old);
++		s = ckmalloc(sizeof(arith_t) * 3 + 2);
++		sprintf(s, ARITH_FMT, v);
++		return s;
++	}
++#endif
++	if (append && old) {
++		s = ckmalloc(strlen(old) + strlen(val) + 1);
++		strcpy(stpcpy(s, old), val);
++	} else
++		s = ckstrdup(val);
++	if (flags & (VLOWER|VUPPER)) {
++		char *p;
++		for (p = s; *p; p++)
++			*p = (flags & VLOWER) ? tolower((unsigned char)*p) : toupper((unsigned char)*p);
++	}
++	return s;
++}
++
++static void
++arr_set(const char *name, const char *sub, const char *val, int append)
++{
++	struct var *vp = *findvar(name);
++	const char *key;
++	arith_t idx;
++	int assoc, i;
++	struct arr *a;
++	char *nv;
++
++	if (vp && (vp->flags & VREADONLY))
++		ash_msg_and_raise_error("%s: readonly variable", name);
++	assoc = arr_index(vp, sub, &key, &idx);
++	vp = *findvar(name);
++	if (!vp)
++		vp = arr_new(name);
++	a = arr_own(vp);
++	i = arr_pos(a, assoc, key, idx);
++	nv = attr_value(vp->flags, i >= 0 ? a->e[i].val : NULL, val, append);
++	arr_put(a, assoc, key, idx, nv);
++	free(nv);
++	if (arr_is0(assoc, key, idx))
++		arr_sync(vp);
++}
++
++static void
++arr_unset(const char *name, const char *sub)
++{
++	struct var *vp = *findvar(name);
++	const char *key;
++	arith_t idx;
++	int assoc;
++
++	if (!vp)
++		return;
++	if ((sub[0] == '@' || sub[0] == '*') && !sub[1] && !(vp->flags & VASSOC)) {
++		unsetvar(name);
++		return;
++	}
++	assoc = arr_index(vp, sub, &key, &idx);
++	vp = *findvar(name);
++	if (!vp)
++		return;
++	if (!vp->arr) {
++		if (arr_is0(assoc, key, idx))
++			unsetvar(name);
++		return;
++	}
++	arr_del(arr_own(vp), assoc, key, idx);
++	if (arr_is0(assoc, key, idx))
++		arr_sync(vp);
++}
++
++/* Replace (or extend) the whole array with values[0..n). keys[i] names an
++ * element explicitly ([k]=v) when not NULL. */
++static void
++arr_assign(const char *name, char **keys, char **values, int n, int append)
++{
++	struct var *vp = *findvar(name);
++	struct arr *a;
++	arith_t next = 0;
++	int assoc, i;
++
++	if (vp && (vp->flags & VREADONLY))
++		ash_msg_and_raise_error("%s: readonly variable", name);
++	if (!vp)
++		vp = arr_new(name);
++	if (!append) {
++		arr_release(vp->arr);
++		vp->arr = NULL;
++		vp->flags |= VUNSET;
++	}
++	a = arr_own(vp);
++	vp->flags &= ~VUNSET;
++	assoc = vp->flags & VASSOC;
++	if (!assoc && a->n)
++		next = a->e[a->n - 1].idx + 1;
++	for (i = 0; i < n; i++) {
++		const char *key = NULL;
++		arith_t idx = next;
++		char *nv;
++		int at;
++
++		if (keys[i]) {
++			if (assoc)
++				key = keys[i];
++			else
++				arr_index(vp, keys[i], &key, &idx);
++			a = arr_own(vp);
++		} else if (assoc) {
++			ash_msg_and_raise_error("%s: %s: must use subscript when assigning associative array", name, values[i]);
++		}
++		at = arr_pos(a, assoc, key, idx);
++		nv = attr_value(vp->flags, at >= 0 ? a->e[at].val : NULL, values[i], 0);
++		arr_put(a, assoc, key, idx, nv);
++		free(nv);
++		next = idx + 1;
++	}
++	arr_sync(vp);
++}
++
++/* The elements (or keys) of name in one malloc'd block; NULL when unset.
++ * The strings point into the variable, so use them before changing it. */
++static char **
++arr_list(const char *name, int keys, int *np)
++{
++	struct var *vp = *findvar(name);
++	char **v, *num;
++	int i, n;
++
++	*np = 0;
++	if (!vp)
++		return NULL;
++	if (!vp->arr) {
++		const char *s = lookupvar(name);
++		if (!s)
++			return NULL;
++		v = ckmalloc(2 * sizeof(char *));
++		v[0] = keys ? (char *)"0" : (char *)s;
++		v[1] = NULL;
++		*np = 1;
++		return v;
++	}
++	n = vp->arr->n;
++	v = ckmalloc((n + 1) * sizeof(char *) + (keys ? n * (sizeof(arith_t) * 3 + 2) : 0));
++	num = (char *)(v + n + 1);
++	for (i = 0; i < n; i++) {
++		if (!keys)
++			v[i] = vp->arr->e[i].val;
++		else if (vp->flags & VASSOC)
++			v[i] = vp->arr->e[i].key;
++		else {
++			v[i] = num;
++			num += sprintf(num, ARITH_FMT, vp->arr->e[i].idx) + 1;
++		}
++	}
++	v[n] = NULL;
++	*np = n;
++	return v;
++}
++
++/* "name[sub]" split in place: returns sub (without brackets) or NULL. */
++static char *
++split_subscript(char *name)
++{
++	char *b = strchr(name, '[');
++	char *e;
++
++	if (!b)
++		return NULL;
++	e = strrchr(b, ']');
++	if (!e || e[1])
++		return NULL;
++	*b = '\0';
++	*e = '\0';
++	return b + 1;
++}
++
++#if ENABLE_FEATURE_SH_MATH
++static const char* FAST_FUNC
++arith_lookupvar(const char *name)
++{
++	const char *r;
++	char *n, *sub;
++
++	if (!strchr(name, '['))
++		return lookupvar(name);
++	n = ckstrdup(name);
++	sub = split_subscript(n);
++	r = sub ? arr_get(n, sub) : NULL;
++	free(n);
++	return r;
++}
++
++static void FAST_FUNC
++arith_setvar(const char *name, const char *val)
++{
++	char *n, *sub;
++
++	if (!strchr(name, '[')) {
++		setvar0(name, val);
++		return;
++	}
++	n = ckstrdup(name);
++	sub = split_subscript(n);
++	if (sub)
++		arr_set(n, sub, val, 0);
++	free(n);
++}
++#endif
+ 
+ /*
+  * Generate a list of variables satisfying the given conditions.
+@@ -4193,9 +4659,79 @@
+ 	jobctl = on;
+ }
+ 
++/* A background job runs to completion before the shell goes on (there is no
++ * second process to run it in). Its pid and status are kept so $!, wait and
++ * kill behave as they would for a job that has already finished. */
++#define BGJOBS 64
++static struct bgjob {
++	pid_t pid;
++	int status;
++	smallint waited;
++} bgjobs[BGJOBS];
++static unsigned bgjob_total;
++
++static void
++bgjob_record(int status)
++{
++	struct bgjob *j = &bgjobs[bgjob_total % BGJOBS];
++	bgjob_total++;
++	j->pid = backgndpid = getpid() + bgjob_total;
++	j->status = status;
++	j->waited = 0;
++}
++
++static struct bgjob *
++bgjob_find(const char *arg)
++{
++	unsigned k;
++
++	if (!bgjob_total)
++		return NULL;
++	if (arg[0] == '%') {
++		const char *p = arg + 1;
++		if (!*p || *p == '%' || *p == '+')
++			k = bgjob_total;
++		else if (*p == '-')
++			k = bgjob_total - 1;
++		else if (isdigit_str(p))
++			k = atoi(p);
++		else
++			return NULL;
++	} else {
++		if (!isdigit_str(arg))
++			return NULL;
++		k = (unsigned)(atoi(arg) - getpid());
++	}
++	if (k < 1 || k > bgjob_total || bgjob_total - k >= BGJOBS)
++		return NULL;
++	return &bgjobs[(k - 1) % BGJOBS];
++}
++
+ static int FAST_FUNC
+ killcmd(int argc, char **argv)
+ {
++	{
++		/* A finished job: signal 0 says it is gone, others succeed quietly. */
++		int i, j, had = 0, sig0 = 0, live = 0;
++		for (i = j = 1; argv[i]; i++) {
++			if (bgjob_find(argv[i])) {
++				had = 1;
++				continue;
++			}
++			if (strcmp(argv[i], "-0") == 0)
++				sig0 = 1;
++			argv[j++] = argv[i];
++		}
++		argv[j] = NULL;
++		if (had) {
++			for (i = 1; i < j; i++)
++				if (isdigit((unsigned char)argv[i][0]) || argv[i][0] == '%')
++					live = 1;
++			if (!live)
++				return sig0;
++			argc = j;
++		}
++	}
+ 	if (argv[1] && strcmp(argv[1], "-l") != 0) {
+ 		int i = 1;
+ 		do {
+@@ -4806,100 +5342,40 @@
+ #endif
+ 
+ static int FAST_FUNC
+-waitcmd(int argc UNUSED_PARAM, char **argv)
+-{
+-	struct job *job;
+-	int retval;
+-	struct job *jp;
+-#if BASH_WAIT_N
+-	int status;
+-	char one = nextopt("n");
+-#else
+-	nextopt(nullstr);
+-#endif
+-	retval = 0;
+-
+-	argv = argptr;
+-	if (!argv[0]) {
+-		/* wait for all jobs / one job if -n */
+-		for (;;) {
+-			jp = curjob;
+-#if BASH_WAIT_N
+-			if (one && !jp)
+-				/* exitcode of "wait -n" with nothing to wait for is 127, not 0 */
+-				retval = 127;
+-#endif
+-			while (1) {
+-				if (!jp) /* no running procs */
+-					goto ret;
+-				if (jp->state == JOBRUNNING)
+-					break;
+-				jp->waited = 1;
+-				jp = jp->prev_job;
+-			}
+-	/* man bash:
+-	 * "When bash is waiting for an asynchronous command via
+-	 * the wait builtin, the reception of a signal for which a trap
+-	 * has been set will cause the wait builtin to return immediately
+-	 * with an exit status greater than 128, immediately after which
+-	 * the trap is executed."
+-	 */
+-#if BASH_WAIT_N
+-			status = dowait(DOWAIT_CHILD_OR_SIG | DOWAIT_JOBSTATUS, NULL);
+-#else
+-			dowait(DOWAIT_CHILD_OR_SIG, NULL);
+-#endif
+-			/* if child sends us a signal *and immediately exits*,
+-			 * dowait() returns pid > 0. Check this case,
+-			 * not "if (dowait() < 0)"!
+-			 */
+-			if (pending_sig)
+-				goto sigout;
+-#if BASH_WAIT_N
+-			if (one) {
+-				/* wait -n waits for one _job_, not one _process_.
+-				 *  date; sleep 3 & sleep 2 | sleep 1 & wait -n; date
+-				 * should wait for 2 seconds. Not 1 or 3.
+-				 */
+-				if (status != -1 && !WIFSTOPPED(status)) {
+-					retval = WEXITSTATUS(status);
+-					if (WIFSIGNALED(status))
+-						retval = 128 | WTERMSIG(status);
+-					goto ret;
+-				}
+-			}
+-#endif
+-		}
+-	}
+-
++waitcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++{
++	int one = 0, retval, i;
++	unsigned k;
++
++	while ((i = nextopt("nf")) != 0)
++		if (i == 'n')
++			one = 1;
++	if (!*argptr) {
++		k = bgjob_total > BGJOBS ? bgjob_total - BGJOBS : 0;
++		for (; k < bgjob_total; k++) {
++			struct bgjob *j = &bgjobs[k % BGJOBS];
++			if (j->waited)
++				continue;
++			j->waited = 1;
++			if (one)
++				return j->status;
++		}
++		return one ? 127 : 0;
++	}
+ 	retval = 127;
+-	do {
+-		if (**argv != '%') {
+-			pid_t pid = number(*argv);
+-			job = curjob;
+-			while (1) {
+-				if (!job)
+-					goto repeat;
+-				if (job->ps[job->nprocs - 1].ps_pid == pid)
+-					break;
+-				job = job->prev_job;
+-			}
+-		} else {
+-			job = getjob(*argv, 0);
+-		}
+-		/* loop until process terminated or stopped */
+-		dowait(DOWAIT_CHILD_OR_SIG, job);
+-		if (pending_sig)
+-			goto sigout;
+-		job->waited = 1;
+-		retval = getstatus(job);
+- repeat: ;
+-	} while (*++argv);
+-
+- ret:
+-	return retval;
+- sigout:
+-	retval = 128 | pending_sig;
++	for (; *argptr; argptr++) {
++		struct bgjob *j = bgjob_find(*argptr);
++		if (!j) {
++			if (**argptr == '%')
++				ash_msg("%s: no such job", *argptr);
++			else
++				ash_msg("pid %s is not a child of this shell", *argptr);
++			retval = 127;
++			continue;
++		}
++		j->waited = 1;
++		retval = j->status;
++	}
+ 	return retval;
+ }
+ 
+@@ -6309,8 +6785,8 @@
+ 	arith_state_t math_state;
+ 	arith_t result;
+ 
+-	math_state.lookupvar = lookupvar;
+-	math_state.setvar    = setvar0;
++	math_state.lookupvar = arith_lookupvar;
++	math_state.setvar    = arith_setvar;
+ 	//math_state.endofname = endofname;
+ 
+ 	INTOFF;
+@@ -6866,6 +7342,94 @@
+ static void subsh_begin(void);
+ static void subsh_end(void);
+ static int eval_subshell_body(union node *n, int flags);
++static struct funcnode *copyfunc(union node *n);
++static void setpwd(const char *val, int setold);
++
++/* >(cmd) reads what the command wrote, so it runs once that command is done:
++ * jobs wait here, tagged with the nesting level of the command (or redirected
++ * compound) whose words created them. After "exec", they wait for exit. */
++struct procsubst_job {
++	struct procsubst_job *next;
++	struct funcnode *f;
++	int in, out, err;
++	int level;
++};
++static struct procsubst_job *procsubst_jobs;
++static int procsubst_level;
++
++static void
++procsubst_defer(union node *n, int rfd)
++{
++	struct procsubst_job *j, **pp;
++
++	j = ckzalloc(sizeof(*j));
++	j->f = copyfunc(n);
++	j->in = fcntl(rfd, F_DUPFD, 10);
++	close(rfd);
++	j->out = fcntl(1, F_DUPFD, 10);
++	j->err = fcntl(2, F_DUPFD, 10);
++	j->level = procsubst_level;
++	for (pp = &procsubst_jobs; *pp; pp = &(*pp)->next)
++		continue;
++	*pp = j;
++}
++
++static void
++procsubst_run(int level)
++{
++	struct procsubst_job **pp = &procsubst_jobs, *j;
++	int status = exitstatus;
++
++	while ((j = *pp) != NULL) {
++		int s0, s1, s2, e;
++		if (j->level < level) {
++			pp = &j->next;
++			continue;
++		}
++		*pp = j->next;
++		flush_stdout_stderr();
++		s0 = fcntl(0, F_DUPFD, 10);
++		s1 = fcntl(1, F_DUPFD, 10);
++		s2 = fcntl(2, F_DUPFD, 10);
++		dup2(j->in, 0);
++		if (j->out >= 0) dup2(j->out, 1);
++		if (j->err >= 0) dup2(j->err, 2);
++		close(j->in);
++		if (j->out >= 0) close(j->out);
++		if (j->err >= 0) close(j->err);
++		subsh_begin();
++		eflag = 0;
++		e = eval_subshell_body(&j->f->n, 0);
++		flush_stdout_stderr();
++		subsh_end();
++		if (s0 >= 0) { dup2(s0, 0); close(s0); }
++		if (s1 >= 0) { dup2(s1, 1); close(s1); }
++		if (s2 >= 0) { dup2(s2, 2); close(s2); }
++		freefunc(j->f);
++		free(j);
++		exitstatus = status;
++		if (e == EXINT)
++			raise_exception(EXINT);
++	}
++	exitstatus = status;
++}
++
++static void
++procsubst_done(int level, int hold)
++{
++	struct procsubst_job *j;
++
++	procsubst_level = level - 1;
++	if (!procsubst_jobs)
++		return;
++	if (hold) {
++		for (j = procsubst_jobs; j; j = j->next)
++			if (j->level >= level)
++				j->level = 0;
++		return;
++	}
++	procsubst_run(level);
++}
+ 
+ static void FAST_FUNC
+ evalbackcmd(union node *n, struct backcmd *result
+@@ -6920,6 +7484,40 @@
+ 		result->jp = NULL;
+ 		goto out;
+ 	}
++#if BASH_PROCESS_SUBST
++	{
++		int fd, e, status = exitstatus;
++		if (ctl == CTLFROMPROC) {
++			/* <(cmd): run it now; the pipe holds all of its output */
++			int save1;
++			flush_stdout_stderr();
++			save1 = fcntl(1, F_DUPFD, 10);
++			subsh_begin();
++			eflag = 0;
++			dup2(pip[1], 1);
++			close(pip[1]);
++			e = eval_subshell_body(n, 0);
++			flush_stdout_stderr();
++			subsh_end();
++			if (save1 >= 0) { dup2(save1, 1); close(save1); }
++			exitstatus = status;
++			if (e == EXINT)
++				raise_exception(EXINT);
++			fd = pip[0];
++		} else {
++			procsubst_defer(n, pip[0]);
++			fd = pip[1];
++		}
++		e = fcntl(fd, F_DUPFD, 64);
++		if (e > 0) {
++			close(fd);
++			fd = e;
++		}
++		pushfd(fd);
++		result->fd = fd;
++		goto out;
++	}
++#endif
+ 	/* process substitution uses NULL job, like openhere() */
+ 	jp = (ctl == CTLBACKQ) ? makejob(1) : NULL;
+ 	if (forkshell(jp, n, FORK_NOJOB) == 0) {
+@@ -7115,6 +7713,110 @@
+ 
+ /* argstr needs it */
+ static char *evalvar(char *p, int flags);
++static void assignword(char *text, int flags, int local);
++enum { SHOPT_NULLGLOB = 1, SHOPT_DOTGLOB = 2, SHOPT_FAILGLOB = 4 };
++static int shopt_flags;
++struct rawbuf {
++	char *s;
++	int n, cap;
++};
++
++static void
++rb_put(struct rawbuf *rb, int c)
++{
++	if (rb->n + 2 > rb->cap) {
++		rb->cap = rb->cap * 2 + 64;
++		rb->s = ckrealloc(rb->s, rb->cap);
++	}
++	rb->s[rb->n++] = c;
++	rb->s[rb->n] = '\0';
++}
++
++static char *rawdq(const char *raw, int inword);
++static char *rawregex(const char *raw);
++static char *rawexpand(const char *src, int syntax, int flag, int *np, int inword);
++
++/* What varvalue() reads instead of the named variable: 1 a scalar (NULL
++ * when unset), 2 a list expanded like "$@". Set only around one call. */
++static struct {
++	int on;
++	const char *s;
++	char **list;
++} vvo;
++/* ${name[key]:=word} assigns the element; read once by subevalvar(). */
++static char *vv_assign_name, *vv_assign_key;
++
++/* Copies the text up to its CTLENDVAR without the CTLESC escapes and
++ * returns the position after it. */
++static char *
++rawtext(char *p, char **out)
++{
++	char *q, *e = p;
++	size_t n = 0;
++
++	while ((unsigned char)*e != CTLENDVAR) {
++		if ((unsigned char)*e == CTLESC)
++			e++;
++		e++;
++		n++;
++	}
++	*out = q = ckmalloc(n + 1);
++	while ((unsigned char)*p != CTLENDVAR) {
++		if ((unsigned char)*p == CTLESC)
++			p++;
++		*q++ = *p++;
++	}
++	*q = '\0';
++	return p + 1;
++}
++
++/* A malloc'd copy of n strings, one block. */
++static char **
++copylist(char **src, int n, int extra)
++{
++	size_t len = 0;
++	char **v, *q;
++	int i;
++
++	for (i = 0; i < n; i++)
++		len += strlen(src[i]) + 1;
++	v = ckmalloc((n + extra + 1) * sizeof(char *) + len);
++	q = (char *)(v + n + extra + 1);
++	for (i = 0; i < n; i++) {
++		v[extra + i] = q;
++		q = stpcpy(q, src[i]) + 1;
++	}
++	v[extra + n] = NULL;
++	return v;
++}
++
++/* "${name[@]}" in double quotes: expands to no word at all when empty. */
++static int
++listword(const char *p)
++{
++	if ((unsigned char)p[0] != CTLVAR
++	 || ((unsigned char)p[1] & ~VSINDIR) != (VSNORMAL | VSSUBSCR)
++	 || !is_name(p[2])
++	)
++		return 0;
++	p += 3;
++	while (is_in_name(*p))
++		p++;
++	return p[0] == '=' && p[1] == '@'
++		&& (unsigned char)p[2] == CTLENDVAR
++		&& (unsigned char)p[3] == CTLQUOTEMARK;
++}
++
++static int
++subtype_per_element(int subtype)
++{
++	return subtype == VSCASE
++		|| (subtype >= VSTRIMRIGHT && subtype <= VSTRIMLEFTMAX)
++#if BASH_PATTERN_SUBST
++		|| subtype == VSREPLACE || subtype == VSREPLACEALL
++#endif
++		;
++}
+ 
+ /*
+  * Perform variable and command substitution.  If EXP_FULL is set, output CTLESC
+@@ -7214,7 +7916,7 @@
+ 			continue;
+ 		case CTLQUOTEMARK:
+ 			/* "$@" syntax adherence hack */
+-			if (!inquotes && !memcmp(p, dolatstr + 1, DOLATSTRLEN - 1)) {
++			if (!inquotes && (!memcmp(p, dolatstr + 1, DOLATSTRLEN - 1) || listword(p))) {
+ 				p = evalvar(p + 1, flag | EXP_QUOTED) + 1;
+ 				goto start;
+ 			}
+@@ -7394,6 +8096,9 @@
+ 	int zero;
+ 	char *(*scan)(char*, char*, char*, char*, int, int);
+ 	char *p;
++	char *as_name = vv_assign_name, *as_key = vv_assign_key;
++
++	vv_assign_name = vv_assign_key = NULL;
+ 
+ 	//bb_error_msg("subevalvar(start:'%s',str:'%s',strloc:%d,startloc:%d,varflags:%x,quotes:%d)",
+ 	//		start, str, strloc, startloc, varflags, quotes);
+@@ -7471,7 +8176,10 @@
+ 
+ 	switch (subtype) {
+ 	case VSASSIGN:
+-		setvar0(str, startp);
++		if (as_name)
++			arr_set(as_name, as_key, startp, 0);
++		else
++			setvar0(str, startp);
+ 
+ 		loc = startp;
+ 		goto out;
+@@ -7627,6 +8335,61 @@
+ 		/* If there's no pattern to match, return the expansion unmolested */
+ 		if (str[0] == '\0')
+ 			goto out1;
++
++		/* "#pat" matches at the start only, "%pat" at the end only */
++		if (str[0] == '#' || str[0] == '%') {
++			char *v = ckstrdup(rmesc);
++			char *pat = ckstrdup(str + 1);
++			char *rp = ckstrdup(repl);
++			size_t vlen = strlen(v), i;
++			ssize_t ms = -1, me = 0;
++
++			if (str[0] == '#') {
++				for (i = vlen + 1; i-- > 0;) {
++					char c = v[i];
++					int ok;
++					v[i] = '\0';
++					ok = pmatch(pat, v);
++					v[i] = c;
++					if (ok) {
++						ms = 0;
++						me = i;
++						break;
++					}
++				}
++			} else {
++				for (i = 0; i <= vlen; i++) {
++					if (pmatch(pat, v + i)) {
++						ms = i;
++						me = vlen;
++						break;
++					}
++				}
++			}
++			if (ms < 0) {
++				free(v);
++				free(pat);
++				free(rp);
++				loc = str - 1;
++				goto out;
++			}
++			memtodest(v, ms, flag & (QUOTES_ESC | EXP_QUOTED));
++			for (loc = rp; *loc; loc++) {
++				if (quotes && *loc == '\\')
++					STPUTC(CTLESC, expdest);
++				STPUTC(*loc, expdest);
++			}
++			memtodest(v + me, vlen - me, flag & (QUOTES_ESC | EXP_QUOTED));
++			len = expdest - ((char *)stackblock() + workloc);
++			STPUTC('\0', expdest);
++			startp = (char *)stackblock() + startloc;
++			memmove(startp, (char *)stackblock() + workloc, len + 1);
++			loc = startp + len;
++			free(v);
++			free(pat);
++			free(rp);
++			goto out;
++		}
+ 
+ 		first_escaped = (str[0] == '\\' && str[1]);
+ 		/* "first_escaped" trick allows to treat e.g. "\*no_glob_chars"
+@@ -7822,6 +8585,11 @@
+ 	flags &= discard ? ~QUOTES_ESC : ~0;
+ 	sep = (flags & EXP_FULL) << CHAR_BIT;
+ 
++	if (vvo.on == 1) {
++		p = vvo.s;
++		goto value;
++	}
++
+ 	switch (*name) {
+ 	case '$':
+ 		num = rootpid;
+@@ -7882,7 +8650,7 @@
+ 		sep |= ifsset() ? (unsigned char)(c & ifsval()[0]) : ' ';
+  param:
+ 		sepc = sep;
+-		ap = shellparam.p;
++		ap = vvo.on == 2 ? vvo.list : shellparam.p;
+ 		if (!ap)
+ 			return -1;
+ 		while ((p = *ap++) != NULL) {
+@@ -7937,6 +8705,149 @@
+ 	return len;
+ }
+ 
++/* ${x^}, ${x^^}, ${x,}, ${x,,}, ${x@Q} and friends, applied to the value
++ * varvalue() put at startloc. Returns the position after the word. */
++static char *
++casemod(char *p, int startloc, int flag, const char *var)
++{
++	int op, all = 0;
++	char *s, *e, *v, *q;
++	struct rawbuf rb = { NULL, 0, 0 };
++
++	if (*p == '@') {
++		op = p[1];
++		p += 2;
++	} else {
++		op = *p++;
++		if (*p == op) {
++			all = 1;
++			p++;
++		}
++	}
++	p = argstr(p, EXP_DISCARD);
++	if (flag & EXP_DISCARD)
++		return p;
++	s = (char *)stackblock() + startloc;
++	e = expdest;
++	if (op == '^' || op == ',' || op == 'U' || op == 'L' || op == 'u') {
++		int first = op == 'u' || (!all && op != 'U' && op != 'L');
++		int up = op == '^' || op == 'U' || op == 'u';
++
++		for (; s < e; s++) {
++			if ((unsigned char)*s == CTLESC) {
++				s++;
++				if (first)
++					break;
++				continue;
++			}
++			*s = up ? toupper((unsigned char)*s) : tolower((unsigned char)*s);
++			if (first)
++				break;
++		}
++		return p;
++	}
++	v = q = ckmalloc(e - s + 1);
++	for (; s < e; s++) {
++		if ((flag & QUOTES_ESC) && (unsigned char)*s == CTLESC && s + 1 < e)
++			s++;
++		*q++ = *s;
++	}
++	*q = '\0';
++	rb_put(&rb, 'x');
++	rb.n = 0;
++	rb.s[0] = '\0';
++	if (op == 'Q') {
++		rb_put(&rb, '\'');
++		for (q = v; *q; q++) {
++			if (*q == '\'') {
++				rb_put(&rb, '\'');
++				rb_put(&rb, '\\');
++				rb_put(&rb, '\'');
++			}
++			rb_put(&rb, *q);
++		}
++		rb_put(&rb, '\'');
++	} else if (op == 'E') {
++		const char *r = v;
++		while (*r) {
++			if (*r == '\\' && r[1]) {
++				r++;
++				rb_put(&rb, bb_process_escape_sequence(&r));
++			} else
++				rb_put(&rb, *r++);
++		}
++	} else if (op == 'a') {
++		const char *n = var;
++		struct var *vp;
++		char *nm = ckmalloc(strchrnul(n, '=') - n + 1);
++		memcpy(nm, n, strchrnul(n, '=') - n);
++		nm[strchrnul(n, '=') - n] = '\0';
++		vp = *findvar(nm);
++		free(nm);
++		if (vp) {
++			if (vp->flags & VARRAY) rb_put(&rb, 'a');
++			if (vp->flags & VASSOC) rb_put(&rb, 'A');
++			if (vp->flags & VINTEGER) rb_put(&rb, 'i');
++			if (vp->flags & VLOWER) rb_put(&rb, 'l');
++			if (vp->flags & VREADONLY) rb_put(&rb, 'r');
++			if (vp->flags & VUPPER) rb_put(&rb, 'u');
++			if (vp->flags & VEXPORT) rb_put(&rb, 'x');
++		}
++	} else {
++		for (q = v; *q; q++)
++			rb_put(&rb, *q);
++	}
++	free(v);
++	expdest = (char *)stackblock() + startloc;
++	memtodest(rb.s, rb.n, flag);
++	free(rb.s);
++	return p;
++}
++
++static int
++strptrcmp(const void *a, const void *b)
++{
++	return strcmp(*(char *const *)a, *(char *const *)b);
++}
++
++/* Names of set variables that start with prefix, sorted. */
++static char **
++prefixnames(const char *prefix, int *np)
++{
++	struct var **vpp, *vp;
++	size_t plen = strlen(prefix);
++	char **v = NULL;
++	int n = 0, cap = 0, i;
++
++	for (vpp = vartab; vpp < vartab + VTABSIZE; vpp++) {
++		for (vp = *vpp; vp; vp = vp->next) {
++			if ((vp->flags & VUNSET) || strncmp(vp->var_text, prefix, plen) != 0)
++				continue;
++			if (n >= cap) {
++				cap = cap * 2 + 16;
++				v = ckrealloc(v, cap * sizeof(char *));
++			}
++			v[n++] = (char *)vp->var_text;
++		}
++	}
++	if (n > 1)
++		qsort(v, n, sizeof(char *), strptrcmp);
++	for (i = 0; i < n; i++) {
++		char *s = ckmalloc(strchrnul(v[i], '=') - v[i] + 1);
++		memcpy(s, v[i], strchrnul(v[i], '=') - v[i]);
++		s[strchrnul(v[i], '=') - v[i]] = '\0';
++		v[i] = s;
++	}
++	{
++		char **r = copylist(v, n, 0);
++		for (i = 0; i < n; i++)
++			free(v[i]);
++		free(v);
++		*np = n;
++		return r;
++	}
++}
++
+ /*
+  * Expand a variable, and return a pointer to the next character in the
+  * input string.
+@@ -7950,19 +8861,261 @@
+ 	int patloc;
+ 	int startloc;
+ 	ssize_t varlen;
+-	int discard;
++	int discard = 0;
+ 	int quoted;
++	int xflags;
++	char *rawsub = NULL;    /* subscript as written */
++	char *own = NULL;       /* name= built here */
++	char **block = NULL;    /* malloc'd list */
++	char **list = NULL;
++	int nlist = 0;
++	int mode = 0;           /* vvo.on for this variable */
++	const char *scalar = NULL;
++	char *scalarbuf = NULL;
++	char *asname = NULL, *askey = NULL;
+ 
+ 	varflags = (unsigned char) *p++;
+ 	subtype = varflags & VSTYPE;
++	xflags = varflags & (VSSUBSCR | VSINDIR);
++	varflags &= ~(VSSUBSCR | VSINDIR);
+ 
+ 	quoted = flag & EXP_QUOTED;
+ 	var = p;
+ 	startloc = expdest - (char *)stackblock();
+ 	p = strchr(p, '=') + 1; //TODO: use var_end(p)?
+ 
++	if (subtype == VSRAW) {
++		char *raw, *r;
++
++		p = rawtext(p, &raw);
++		if (!(flag & EXP_DISCARD)) {
++			if (*var == '(') {
++				memtodest("\001(", 2, flag);
++				r = ckstrdup(raw);
++			} else
++				r = *var == '~' ? rawregex(raw) : rawdq(raw, 1);
++			memtodest(r, strlen(r), flag);
++			free(r);
++		}
++		free(raw);
++		return p;
++	}
++	if (xflags & VSSUBSCR)
++		p = rawtext(p, &rawsub);
++
++ resolve:
++	if (xflags) {
++		char *nm, *sub = rawsub, *tsub = NULL;
++		int listat = 0;
++		size_t l = strchr(var, '=') - var;
++
++		free(own);
++		free(block);
++		free(scalarbuf);
++		free(asname);
++		free(askey);
++		own = scalarbuf = asname = askey = NULL;
++		block = list = NULL;
++		nlist = 0;
++		mode = 0;
++		nm = ckmalloc(l + 2);
++		memcpy(nm, var, l);
++		nm[l] = '\0';
++		if (xflags & VSINDIR) {
++			if (!sub && l && (nm[l - 1] == '*' || nm[l - 1] == '@')) {
++				listat = nm[l - 1] == '@';
++				nm[l - 1] = '\0';
++				block = list = prefixnames(nm, &nlist);
++				mode = 2;
++			} else if (sub && (sub[0] == '@' || sub[0] == '*') && !sub[1]) {
++				int n;
++				char **keys = arr_list(nm, 1, &n);
++				listat = sub[0] == '@';
++				if (keys) {
++					block = list = copylist(keys, n, 0);
++					nlist = n;
++					free(keys);
++				}
++				mode = 2;
++			} else {
++				const char *t;
++				if (sub) {
++					char *k = rawdq(sub, 1);
++					t = arr_get(nm, k);
++					free(k);
++				} else if (isdigit((unsigned char)nm[0])) {
++					int num = atoi(nm);
++					t = num == 0 ? arg0 : num <= shellparam.nparam ? shellparam.p[num - 1] : NULL;
++				} else
++					t = lookupvar(nm);
++				if (!t) {
++					mode = 1;
++				} else {
++					free(nm);
++					nm = ckmalloc(strlen(t) + 2);
++					strcpy(nm, t);
++					tsub = split_subscript(nm);
++					sub = tsub;
++					if (!sub && !is_name(nm[0])) {
++						/* a special or positional parameter */
++						own = nm;
++						strcat(own, "=");
++						var = own;
++						nm = NULL;
++					}
++				}
++			}
++		}
++		if (!mode && nm) {
++			if (sub && (sub[0] == '@' || sub[0] == '*') && !sub[1]) {
++				int n;
++				char **vals = arr_list(nm, 0, &n);
++				listat = sub[0] == '@';
++				if (vals) {
++					block = list = copylist(vals, n, 0);
++					nlist = n;
++					free(vals);
++				}
++				mode = 2;
++			} else if (sub) {
++				char *k = tsub ? ckstrdup(tsub) : rawdq(sub, 1);
++				const char *v = arr_get(nm, k);
++				scalarbuf = v ? ckstrdup(v) : NULL;
++				scalar = scalarbuf;
++				mode = 1;
++				asname = ckstrdup(nm);
++				askey = k;
++			} else {
++				own = nm;
++				strcat(own, "=");
++				var = own;
++				nm = NULL;
++			}
++		}
++		if (mode == 2) {
++			if (!block)
++				nlist = -1;
++			var = (char *)(listat ? "@=" : "*=");
++		}
++		free(nm);
++	} else if ((*var == '@' || *var == '*') && var[1] == '='
++	 && (subtype == VSSUBSTR || subtype == VSLENGTH || subtype_per_element(subtype))
++	) {
++		int extra = subtype == VSSUBSTR;
++		block = list = copylist(shellparam.p, shellparam.nparam, extra);
++		if (extra)
++			list[0] = (char *)arg0;
++		nlist = shellparam.nparam + extra;
++		mode = 2;
++	}
++
++	if (mode == 2 && subtype == VSLENGTH) {
++		p++;
++		if (!(flag & EXP_DISCARD)) {
++			cvtnum(nlist > 0 ? nlist : 0, flag);
++			if (!quoted)
++				recordregion(startloc, expdest - (char *)stackblock(), 0);
++		}
++		goto ret;
++	}
++
++#if BASH_SUBSTR
++	if (mode == 2 && subtype == VSSUBSTR) {
++		int loc0 = expdest - (char *)stackblock();
++
++		p = argstr(p, EXP_TILDE | (flag & EXP_DISCARD));
++		if (!(flag & EXP_DISCARD)) {
++			int total = nlist > 0 ? nlist : 0;
++			int pos, len;
++			char *w = (char *)stackblock() + loc0;
++			char *colon = strchr(w, ':');
++
++			if (colon)
++				*colon = '\0';
++			pos = substr_atoi(w);
++			len = colon ? substr_atoi(colon + 1) : total;
++			expdest = (char *)stackblock() + loc0;
++			if (pos < 0)
++				pos += total;
++			if (pos < 0 || pos > total) {
++				pos = 0;
++				len = 0;
++			}
++			if (len < 0)
++				len += total - pos;
++			if (len < 0)
++				len = 0;
++			if (len > total - pos)
++				len = total - pos;
++			if (list) {
++				list += pos;
++				nlist = len;
++				list[len] = NULL;
++			}
++		}
++		vvo.on = 2;
++		vvo.list = list;
++		varvalue(var, varflags, flag, quoted);
++		vvo.on = 0;
++		goto record;
++	}
++#endif
++
++	if (mode == 2 && subtype_per_element(subtype)) {
++		struct nodelist *bq = argbackq;
++		char *np = p;
++		char sepc;
++		int usesep, i;
++
++		if (quoted && *var == '@' && (flag & EXP_FULL)) {
++			sepc = '\0';
++			usesep = 1;
++		} else {
++			sepc = ifsset() ? ifsval()[0] : ' ';
++			usesep = sepc != '\0';
++		}
++		if ((flag & EXP_DISCARD) || nlist <= 0)
++			np = argstr(p, EXP_DISCARD);
++		else for (i = 0; i < nlist; i++) {
++			int eloc = expdest - (char *)stackblock();
++
++			argbackq = bq;
++			vvo.on = 1;
++			vvo.s = list[i];
++			varvalue(var, varflags, flag, quoted);
++			vvo.on = 0;
++			if (subtype == VSCASE)
++				np = casemod(p, eloc, flag, var);
++			else {
++				STPUTC('\0', expdest);
++				patloc = expdest - (char *)stackblock();
++				np = subevalvar(p, NULL, patloc, eloc, varflags, flag);
++			}
++			if (i + 1 < nlist && usesep)
++				memtodest(&sepc, 1, flag | EXP_KEEPNUL);
++		}
++		p = np;
++		goto record;
++	}
++
++	if (subtype == VSCASE) {
++		vvo.on = mode;
++		vvo.s = scalar;
++		vvo.list = list;
++		varlen = varvalue(var, varflags, flag, quoted);
++		vvo.on = 0;
++		if (varlen < 0 && uflag && !(flag & EXP_DISCARD))
++			varunset(p, var, 0, 0);
++		p = casemod(p, startloc, flag, var);
++		goto record;
++	}
++
+  again:
++	vvo.on = mode;
++	vvo.s = scalar;
++	vvo.list = list;
+ 	varlen = varvalue(var, varflags, flag, quoted);
++	vvo.on = 0;
+ 	if (varflags & VSNUL)
+ 		varlen--;
+ 
+@@ -7979,14 +9132,21 @@
+ 
+ 	case VSASSIGN:
+ 	case VSQUESTION:
++		if (asname) {
++			vv_assign_name = asname;
++			vv_assign_key = askey;
++		}
+ 		p = subevalvar(p, var, 0, startloc, varflags,
+ 			(flag & ~QUOTES_ESC) | (discard ^ EXP_DISCARD));
++		vv_assign_name = vv_assign_key = NULL;
+ 
+ 		if ((flag | ~discard) & EXP_DISCARD)
+ 			goto record;
+ 
+ 		varflags &= ~VSNUL;
+ 		subtype = VSNORMAL;
++		if (xflags)
++			goto resolve;
+ 		goto again;
+ 	}
+ 
+@@ -7996,32 +9156,13 @@
+ 	if (subtype == VSLENGTH) {
+ 		p++;
+ 		if (flag & EXP_DISCARD)
+-			return p;
++			goto ret;
+ 		cvtnum(varlen > 0 ? varlen : 0, flag);
+ 		goto really_record;
+ 	}
+ 
+ 	if (subtype == VSNORMAL)
+ 		goto record;
+-
+-#if DEBUG
+-	switch (subtype) {
+-	case VSTRIMLEFT:
+-	case VSTRIMLEFTMAX:
+-	case VSTRIMRIGHT:
+-	case VSTRIMRIGHTMAX:
+-#if BASH_SUBSTR
+-	case VSSUBSTR:
+-#endif
+-#if BASH_PATTERN_SUBST
+-	case VSREPLACE:
+-	case VSREPLACEALL:
+-#endif
+-		break;
+-	default:
+-		abort();
+-	}
+-#endif
+ 
+ 	flag |= discard;
+ 	if (!(flag & EXP_DISCARD)) {
+@@ -8037,15 +9178,22 @@
+ 
+  record:
+ 	if ((flag | discard) & EXP_DISCARD)
+-		return p;
++		goto ret;
+ 
+  really_record:
+ 	if (quoted) {
+-		quoted = *var == '@' && shellparam.nparam;
++		quoted = *var == '@' && (mode == 2 ? nlist > 0 : shellparam.nparam);
+ 		if (!quoted)
+-			return p;
++			goto ret;
+ 	}
+ 	recordregion(startloc, expdest - (char *)stackblock(), quoted);
++ ret:
++	free(rawsub);
++	free(own);
++	free(block);
++	free(scalarbuf);
++	free(asname);
++	free(askey);
+ 	return p;
+ }
+ 
+@@ -8296,7 +9444,9 @@
+ 	if (*p == '.')
+ 		matchdot++;
+ 	while (!pending_int && (dp = readdir(dirp)) != NULL) {
+-		if (dp->d_name[0] == '.' && !matchdot)
++		if (dp->d_name[0] == '.' && !matchdot
++		 && (!(shopt_flags & SHOPT_DOTGLOB) || DOT_OR_DOTDOT(dp->d_name))
++		)
+ 			continue;
+ 		if (pmatch(start, dp->d_name)) {
+ 			if (atend) {
+@@ -8426,6 +9576,12 @@
+ 			/*
+ 			 * no matches
+ 			 */
++			if (shopt_flags & SHOPT_FAILGLOB)
++				ash_msg_and_raise_error("no match: %s", str->text);
++			if (shopt_flags & SHOPT_NULLGLOB) {
++				str = str->next;
++				continue;
++			}
+  nometa:
+ 			*exparg.lastp = str;
+ 			rmescapes(str->text, 0, NULL);
+@@ -8448,8 +9604,273 @@
+  * perform splitting and file name expansion.  When arglist is NULL, perform
+  * here document expansion.
+  */
++/* ---- brace expansion ----
++ * Runs on the parsed word before any other expansion: only literal,
++ * unquoted braces count, so the scan steps over quoted text, escaped
++ * characters and whole ${...} and $((...)) parts. */
++#define BRACE_MAX 100000
++
++/* Past the substitution whose CTL byte is at p. */
++static const char *
++brace_skipvar(const char *p)
++{
++	int t, depth;
++
++	if ((unsigned char)*p == CTLARI) {
++		depth = 1;
++		for (p++; *p && depth; p++) {
++			unsigned char c = *p;
++			if (c == CTLESC && p[1])
++				p++;
++			else if (c == CTLVAR)
++				p = brace_skipvar(p) - 1;
++			else if (c == CTLARI)
++				depth++;
++			else if (c == CTLENDARI)
++				depth--;
++		}
++		return p;
++	}
++	t = (unsigned char)p[1];
++	p += 2;
++	while (*p && *p != '=')
++		p++;
++	if (*p)
++		p++;
++	if (t & VSSUBSCR) {
++		while (*p && (unsigned char)*p != CTLENDVAR) {
++			if ((unsigned char)*p == CTLESC && p[1])
++				p++;
++			p++;
++		}
++		if (*p)
++			p++;
++	}
++	if ((t & VSTYPE) == VSNORMAL)
++		return p;
++	depth = 1;
++	while (*p && depth) {
++		unsigned char c = *p;
++		if (c == CTLESC && p[1]) {
++			p += 2;
++			continue;
++		}
++		if (c == CTLVAR || c == CTLARI) {
++			p = brace_skipvar(p);
++			continue;
++		}
++		if (c == CTLENDVAR)
++			depth--;
++		p++;
++	}
++	return p;
++}
++
++/* Next literal character position at or after p (NULL at the end). */
++static const char *
++brace_next(const char *p, int *inq)
++{
++	for (;;) {
++		unsigned char c = *p;
++		if (!c)
++			return NULL;
++		if (c == CTLQUOTEMARK) {
++			*inq ^= 1;
++			p++;
++			continue;
++		}
++		if (*inq || c == CTLESC) {
++			p += (c == CTLESC && p[1]) ? 2 : 1;
++			continue;
++		}
++		if (c == CTLVAR || c == CTLARI) {
++			p = brace_skipvar(p);
++			continue;
++		}
++		return p;
++	}
++}
++
++static int
++brace_seq_end(const char *s, const char *e, long *v, int *isch, int *width)
++{
++	const char *q = s;
++	char *end;
++
++	if (e - s == 1 && isalpha((unsigned char)*s)) {
++		*v = (unsigned char)*s;
++		*isch = 1;
++		*width = 0;
++		return 1;
++	}
++	if (q < e && (*q == '-' || *q == '+'))
++		q++;
++	if (q >= e || !isdigit((unsigned char)*q))
++		return 0;
++	*v = strtol(s, &end, 10);
++	if (end != e)
++		return 0;
++	*isch = 0;
++	*width = (q[0] == '0' && e - q > 1) ? (int)(e - s) : 0;
++	return 1;
++}
++
++struct brace_out {
++	char **v;
++	int n, cap;
++};
++
++static void
++brace_push(struct brace_out *o, char *s)
++{
++	if (o->n >= BRACE_MAX) {
++		free(s);
++		ash_msg_and_raise_error("brace expansion exceeds %d words", BRACE_MAX);
++	}
++	if (o->n >= o->cap) {
++		o->cap = o->cap * 2 + 16;
++		o->v = ckrealloc(o->v, o->cap * sizeof(char *));
++	}
++	o->v[o->n++] = s;
++}
++
++static void brace_expand(const char *s, struct brace_out *o);
++
++static void
++brace_emit(const char *pre, size_t plen, const char *mid, size_t mlen, const char *post, struct brace_out *o)
++{
++	size_t qlen = strlen(post);
++	char *w = ckmalloc(plen + mlen + qlen + 1);
++
++	memcpy(w, pre, plen);
++	memcpy(w + plen, mid, mlen);
++	strcpy(w + plen + mlen, post);
++	brace_expand(w, o);
++	free(w);
++}
++
++static void
++brace_expand(const char *s, struct brace_out *o)
++{
++	const char *p = s;
++	int inq = 0;
++
++	while ((p = brace_next(p, &inq)) != NULL) {
++		const char *q, *close = NULL, *commas[1024];
++		int depth = 0, ncomma = 0, qinq;
++
++		if (*p != '{') {
++			p++;
++			continue;
++		}
++		qinq = inq;
++		q = p + 1;
++		while ((q = brace_next(q, &qinq)) != NULL) {
++			if (*q == '{')
++				depth++;
++			else if (*q == '}') {
++				if (depth-- == 0) {
++					close = q;
++					break;
++				}
++			} else if (*q == ',' && depth == 0 && ncomma < 1024)
++				commas[ncomma++] = q;
++			q++;
++		}
++		if (!close) {
++			p++;
++			continue;
++		}
++		if (ncomma) {
++			const char *a = p + 1;
++			int i;
++			for (i = 0; i <= ncomma; i++) {
++				const char *b = i < ncomma ? commas[i] : close;
++				brace_emit(s, p - s, a, b - a, close + 1, o);
++				a = b + 1;
++			}
++			return;
++		} else {
++			/* {x..y} or {x..y..step} over plain text */
++			const char *b = p + 1, *d1, *d2;
++			long from, to, step = 1;
++			int ch1, ch2, w1, w2, width;
++
++			for (q = b; q < close; q++)
++				if ((unsigned char)*q >= CTL_FIRST && (unsigned char)*q <= CTL_LAST)
++					break;
++			d1 = q == close ? strstr(b, "..") : NULL;
++			if (d1 && d1 < close
++			 && brace_seq_end(b, d1, &from, &ch1, &w1)
++			) {
++				d2 = strstr(d1 + 2, "..");
++				if (d2 && d2 > close)
++					d2 = NULL;
++				if (brace_seq_end(d1 + 2, d2 ? d2 : close, &to, &ch2, &w2) && ch1 == ch2) {
++					int ok = 1;
++					if (d2) {
++						char *end;
++						step = strtol(d2 + 2, &end, 10);
++						ok = end == close;
++						if (step < 0)
++							step = -step;
++					}
++					if (step == 0)
++						step = 1;
++					if (ok) {
++						long v;
++						char buf[64];
++						width = w1 > w2 ? w1 : w2;
++						for (v = from; from <= to ? v <= to : v >= to; v += from <= to ? step : -step) {
++							int len = ch1 ? sprintf(buf, "%c", (int)v)
++								: sprintf(buf, "%0*ld", width, v);
++							brace_emit(s, p - s, buf, len, close + 1, o);
++						}
++						return;
++					}
++				}
++			}
++		}
++		p++;
++	}
++	brace_push(o, ckstrdup(s));
++}
++
++static void expandarg_one(union node *arg, struct arglist *arglist, int flag);
++
+ static void
+ expandarg(union node *arg, struct arglist *arglist, int flag)
++{
++	const char *t = arg->narg.text;
++	struct brace_out o = { NULL, 0, 0 };
++	union node tmp;
++	int i;
++
++	if (!(flag & EXP_FULL) || !arglist || !strchr(t, '{')
++	 || strpbrk(t, "\204\210\211")
++	) {
++		expandarg_one(arg, arglist, flag);
++		return;
++	}
++	brace_expand(t, &o);
++	if (o.n == 1 && strcmp(o.v[0], t) == 0) {
++		free(o.v[0]);
++		free(o.v);
++		expandarg_one(arg, arglist, flag);
++		return;
++	}
++	tmp = *arg;
++	for (i = 0; i < o.n; i++) {
++		tmp.narg.text = o.v[i];
++		expandarg_one(&tmp, arglist, flag);
++	}
++	for (i = 0; i < o.n; i++)
++		free(o.v[i]);
++	free(o.v);
++}
++
++static void
++expandarg_one(union node *arg, struct arglist *arglist, int flag)
+ {
+ 	struct strlist *sp;
+ 	char *p;
+@@ -9380,9 +10801,13 @@
+ 			path = bb_default_path;
+ 
+ 	/* Mimic bash: just "command -v" doesn't complain, it's a nop */
+-	cmd = *argptr;
+-	if (/*verify && */ cmd)
+-		return describe_command(cmd, path, verify /* - VERIFY_BRIEF*/);
++	{
++		int status = 0;
++		while ((cmd = *argptr++) != NULL)
++			if (describe_command(cmd, path, verify))
++				status = 1;
++		return status;
++	}
+ 
+ 	return 0;
+ }
+@@ -9774,6 +11199,32 @@
+  * Evaluate a parse tree.  The value is left in the global variable
+  * exitstatus.
+  */
++/* Raised by the write wrappers on EPIPE; pipe_writers counts the pipeline
++ * stages whose stdout is a pipe. */
++extern int bb_sigpipe;
++static int pipe_writers;
++
++/* A ^C (or a timeout's deadline) reaches the shell's own loops the way it
++ * reaches applets: the host's interrupt count, sampled every 256 nodes and
++ * compared with its value when the current command line started. */
++extern int __host_interrupt(void);
++static int intr_base;
++static unsigned intr_tick;
++static void
++intr_poll(void)
++{
++	int c;
++
++	if (++intr_tick & 255)
++		return;
++	c = __host_interrupt();
++	if (c != intr_base) {
++		intr_base = c;
++		exitstatus = 128 + SIGINT;
++		raise_exception(EXINT);
++	}
++}
++
+ static int
+ evaltree(union node *n, int flags)
+ {
+@@ -9794,6 +11245,16 @@
+ 	TRACE(("evaltree(%p: %d, %d) called\n", n, n->type, flags));
+ 
+ 	dotrap();
++	intr_poll();
++	if (bb_sigpipe) {
++		/* the reader is gone: end this stage as SIGPIPE would */
++		bb_sigpipe = 0;
++		if (pipe_writers) {
++			clearerr(stdout);
++			exitstatus = savestatus = 128 + SIGPIPE;
++			raise_exception(EXEXIT);
++		}
++	}
+ 
+ 	switch (n->type) {
+ 	default:
+@@ -9805,7 +11266,9 @@
+ 	case NNOT:
+ 		status = !evaltree(n->nnot.com, EV_TESTED);
+ 		break;
+-	case NREDIR:
++	case NREDIR: {
++		int lvl = ++procsubst_level;
++		struct redirtab *stop = redirlist;
+ 		errlinno = lineno = n->nredir.linno;
+ 		expredir(n->nredir.redirect);
+ 		pushredir(n->nredir.redirect);
+@@ -9815,7 +11278,11 @@
+ 		}
+ 		if (n->nredir.redirect)
+ 			popredir(/*drop:*/ 0);
++		unwindredir(stop);
++		procsubst_done(lvl, 0);
++		exitstatus = status;
+ 		break;
++	}
+ 	case NCMD:
+ 		evalfn = evalcommand;
+  checkexit:
+@@ -9977,6 +11444,26 @@
+ 	return status;
+ }
+ 
++#if ENABLE_FEATURE_SH_MATH
++/* One clause of for (( ; ; )); an empty one is true. */
++static int
++arithfor_clause(union node *arg)
++{
++	struct stackmark smark;
++	struct arglist al;
++	arith_t v = 1;
++
++	setstackmark(&smark);
++	al.lastp = &al.list;
++	expandarg(arg, &al, 0);
++	*al.lastp = NULL;
++	if (al.list && al.list->text[strspn(al.list->text, " \t\n")])
++		v = ash_arith(al.list->text);
++	popstackmark(&smark);
++	return v != 0;
++}
++#endif
++
+ static int
+ evalfor(union node *n, int flags)
+ {
+@@ -9986,6 +11473,25 @@
+ 	int status = 0;
+ 
+ 	errlinno = lineno = n->ncase.linno;
++#if ENABLE_FEATURE_SH_MATH
++	if (n->nfor.var[0] == '(') {
++		union node *init = n->nfor.args;
++		union node *cond = init->narg.next;
++		union node *step = cond->narg.next;
++
++		arithfor_clause(init);
++		loopnest++;
++		flags &= EV_TESTED;
++		while (arithfor_clause(cond)) {
++			status = evaltree(n->nfor.body, flags);
++			if (skiploop() & ~SKIPCONT)
++				break;
++			arithfor_clause(step);
++		}
++		loopnest--;
++		return status;
++	}
++#endif
+ 
+ 	arglist.list = NULL;
+ 	arglist.lastp = &arglist.list;
+@@ -10075,36 +11581,67 @@
+ static int
+ evalsubshell(union node *n, int flags)
+ {
+-	struct job *jp;
+-	int backgnd = (n->type == NBACKGND); /* FORK_BG(1) if yes, else FORK_FG(0) */
+-	int status;
++	int backgnd = (n->type == NBACKGND);
++	int status, e = -1, save0 = -1;
++	int lvl = ++procsubst_level;
++	char *savecwd, *savecurdir;
++	struct shparam saveparam;
++	struct redirtab *redir_stop;
+ 
+ 	errlinno = lineno = n->nredir.linno;
+ 
++	INTOFF;
++	redir_stop = redirlist;
+ 	expredir(n->nredir.redirect);
+-	if (!backgnd && (flags & EV_EXIT) && !may_have_traps)
+-		goto nofork;
+-	INTOFF;
+-	if (backgnd == FORK_FG)
+-		get_tty_state();
+-	jp = makejob(1);
+-	if (forkshell(jp, n, backgnd) == 0) {
+-		/* child */
+-		INTON;
+-		flags |= EV_EXIT;
+-		if (backgnd)
+-			flags &= ~EV_TESTED;
+- nofork:
+-		reset_exception_handler();
+-		redirect(n->nredir.redirect, 0);
+-		evaltreenr(n->nredir.n, flags);
+-		/* never returns */
+-	}
+-	/* parent */
+-	status = 0;
+-	if (backgnd == FORK_FG)
+-		status = waitforjob(jp);
++	flush_stdout_stderr();
++	/* The subshell runs in this process: everything it may change and a
++	 * child would have kept to itself is saved here and put back after. */
++	savecwd = getcwd(NULL, 0);
++	savecurdir = ckstrdup(curdir);
++	saveparam = shellparam;
++	shellparam.malloced = 0;
++	subsh_begin();
++	if (backgnd) {
++		int nul = open(bb_dev_null, O_RDONLY);
++		flags &= ~EV_TESTED;
++		save0 = fcntl(0, F_DUPFD, 10);
++		if (nul >= 0) {
++			dup2(nul, 0);
++			close(nul);
++		}
++	}
++	pushredir(n->nredir.redirect);
++	status = redirectsafe(n->nredir.redirect, REDIR_PUSH);
++	if (!status) {
++		e = eval_subshell_body(n->nredir.n, flags & ~EV_EXIT);
++		status = exitstatus;
++	}
++	flush_stdout_stderr();
++	unwindredir(redir_stop);
++	evalskip = 0;
++	subsh_end();
++	if (save0 >= 0) {
++		dup2(save0, 0);
++		close(save0);
++	}
++	if (savecwd) {
++		if (chdir(savecwd) == 0)
++			setpwd(savecurdir, 0);
++		free(savecwd);
++	}
++	free(savecurdir);
++	if (shellparam.malloced)
++		freeparam(&shellparam);
++	shellparam = saveparam;
+ 	INTON;
++	procsubst_done(lvl, 0);
++	if (e == EXINT)
++		raise_exception(EXINT);
++	if (backgnd) {
++		bgjob_record(status);
++		status = 0;
++	}
++	exitstatus = status;
+ 	return status;
+ }
+ 
+@@ -10186,6 +11723,8 @@
+ 	int pip[2];
+ 	int status = 0;
+ 	int save0, save1;
++	int nstages, failed = 0;
++	char **stages, *stagebuf;
+ 
+ 	TRACE(("evalpipe(0x%lx) called\n", (long)n));
+ 	/* ---- fork-free pipeline (POC, no OS fork) --------------------------
+@@ -10202,6 +11741,12 @@
+ 	 * lastpipe). Fine for finite builtin pipelines. */
+ 	INTOFF;
+ 	prevfd = -1;
++	nstages = 0;
++	for (lp = n->npipe.cmdlist; lp; lp = lp->next)
++		nstages++;
++	stages = ckzalloc(nstages * sizeof(char *) + nstages * (sizeof(int) * 3 + 2));
++	stagebuf = (char *)(stages + nstages);
++	nstages = 0;
+ 	for (lp = n->npipe.cmdlist; lp; lp = lp->next) {
+ 		prehash(lp->n);
+ 		pip[1] = -1;
+@@ -10220,9 +11765,20 @@
+ 			dup2(pip[1], 1);
+ 			close(pip[1]);
+ 		}
++		if (pip[1] >= 0)
++			pipe_writers++;
+ 		eval_subshell_body(lp->n, flags & ~EV_EXIT);
+ 		flush_stdout_stderr();
++		if (pip[1] >= 0) {
++			pipe_writers--;
++			bb_sigpipe = 0;
++			clearerr(stdout);
++		}
+ 		subsh_end();
++		stages[nstages++] = stagebuf;
++		stagebuf += sprintf(stagebuf, "%d", exitstatus) + 1;
++		if (exitstatus)
++			failed = exitstatus;
+ 		if (save0 >= 0) { dup2(save0, 0); close(save0); }
+ 		if (save1 >= 0) { dup2(save1, 1); close(save1); }
+ 		if (prevfd >= 0)
+@@ -10232,7 +11788,19 @@
+ 	if (prevfd >= 0)
+ 		close(prevfd);
+ 	status = exitstatus;
++	if (pipefail && failed)
++		status = failed;
++	{
++		char **kp = ckzalloc((nstages + 1) * sizeof(char *));
++		arr_assign("PIPESTATUS", kp, stages, nstages, 0);
++		free(kp);
++	}
++	free(stages);
+ 	INTON;
++	if (n->npipe.pipe_backgnd) {
++		bgjob_record(status);
++		status = 0;
++	}
+ 	return status;
+ }
+ 
+@@ -10336,6 +11904,8 @@
+ 		TRACE(("poplocalvar %s\n", vp ? vp->var_text : "-"));
+ 		if (keep) {
+ 			int bits = VSTRFIXED;
++
++			arr_release(lvp->arr);
+ 
+ 			if (lvp->flags != VUNSET) {
+ 				if (vp->var_text == lvp->text)
+@@ -10364,6 +11934,8 @@
+ 				free((char*)vp->var_text);
+ 			vp->flags = lvp->flags;
+ 			vp->var_text = lvp->text;
++			arr_release(vp->arr);
++			vp->arr = lvp->arr;
+ 		}
+ 		free(lvp);
+ 	}
+@@ -10524,6 +12096,9 @@
+ 		} else {
+ 			lvp->text = vp->var_text;
+ 			lvp->flags = vp->flags;
++			lvp->arr = vp->arr;
++			if (vp->arr)
++				vp->arr->ref++;
+ 			/* make sure neither "struct var" nor string gets freed
+ 			 * during (un)setting:
+ 			 */
+@@ -10552,6 +12127,14 @@
+  * scope), then poplocalvars() restores the rest and the options. $? is left
+  * alone so it propagates out (as $(...) / subshells require). Not yet handled:
+  * traps, cwd (cd is a no-op in this wasm), positional params, function defs. */
++/* A subshell starts without the EXIT and ERR traps of its parent; its own
++ * EXIT trap runs as it ends (eval_subshell_body). */
++struct subsh_trap {
++	struct subsh_trap *prev;
++	char *exit_trap, *err_trap;
++};
++static struct subsh_trap *subsh_traps;
++
+ static void
+ subsh_begin(void)
+ {
+@@ -10560,6 +12143,14 @@
+ 	int tn = 0, tcap = 32, i;
+ 
+ 	INTOFF;
++	{
++		struct subsh_trap *t = ckmalloc(sizeof(*t));
++		t->prev = subsh_traps;
++		t->exit_trap = trap[0];
++		t->err_trap = trap[NTRAP_ERR];
++		trap[0] = trap[NTRAP_ERR] = NULL;
++		subsh_traps = t;
++	}
+ 	pushlocalvars(1);
+ 	mklocal((char *)"-", 0);            /* snapshot all shell options ($-) */
+ 	texts = ckmalloc(tcap * sizeof(texts[0]));
+@@ -10575,7 +12166,7 @@
+ 		}
+ 	}
+ 	for (i = 0; i < tn; i++) {
+-		mklocal(texts[i], 0);           /* setvareq copies it -> free our copy */
++		mklocal(texts[i], VARRSYNC);           /* setvareq copies it -> free our copy */
+ 		free(texts[i]);
+ 	}
+ 	free(texts);
+@@ -10617,6 +12208,17 @@
+ 	}
+ 	free(leaked);
+ 	poplocalvars(0);                    /* restore saved vars + options */
++	{
++		struct subsh_trap *t = subsh_traps;
++		if (t) {
++			free(trap[0]);
++			free(trap[NTRAP_ERR]);
++			trap[0] = t->exit_trap;
++			trap[NTRAP_ERR] = t->err_trap;
++			subsh_traps = t->prev;
++			free(t);
++		}
++	}
+ 	INTON;
+ }
+ 
+@@ -10631,22 +12233,41 @@
+ 	struct jmploc *volatile savehandler = exception_handler;
+ 	struct jmploc jmploc;
+ 	volatile int saveint;
+-	int e;
++	volatile int ret = -1;
++	int entry_savestatus = savestatus;
+ 
+ 	SAVE_INT(saveint);
+-	e = setjmp(jmploc.loc);
+-	if (!e) {
++	if (!setjmp(jmploc.loc)) {
+ 		exception_handler = &jmploc;
+ 		evaltree(n, flags);
+-	}
++	} else {
++		ret = exception_type;
++		/* mirror the top-level EXEXIT handler: `exit N` stashes N in savestatus */
++		if (exception_type == EXEXIT && savestatus >= 0)
++			exitstatus = savestatus;
++	}
++	if (trap[0] && subsh_traps && ret != EXINT) {
++		volatile int st = exitstatus;
++		volatile int depth = trap_depth;
++		char *volatile p = trap[0];
++		trap[0] = NULL;
++		savestatus = -1;
++		if (!setjmp(jmploc.loc)) {
++			exception_handler = &jmploc;
++			evalskip = 0;
++			trap_depth++;
++			evalstring(p, 0);
++		} else if (exception_type == EXEXIT && savestatus >= 0) {
++			st = savestatus;
++		}
++		trap_depth = depth;
++		free(p);
++		exitstatus = st;
++	}
++	savestatus = entry_savestatus;
+ 	exception_handler = savehandler;
+ 	RESTORE_INT(saveint);
+-	/* mirror the top-level EXEXIT handler: `exit N` stashes N in savestatus */
+-	if (e == 0)
+-		return -1;
+-	if (exception_type == EXEXIT && savestatus >= 0)
+-		exitstatus = savestatus;
+-	return exception_type;
++	return ret;
+ }
+ 
+ static int FAST_FUNC
+@@ -10927,6 +12548,7 @@
+ static int setcmd(int, char **) FAST_FUNC;
+ static int shiftcmd(int, char **) FAST_FUNC;
+ static int timescmd(int, char **) FAST_FUNC;
++static int timekwcmd(int, char **) FAST_FUNC;
+ static int trapcmd(int, char **) FAST_FUNC;
+ static int umaskcmd(int, char **) FAST_FUNC;
+ static int unsetcmd(int, char **) FAST_FUNC;
+@@ -10944,9 +12566,433 @@
+ /* Stubs for calling non-FAST_FUNC's */
+ #if ENABLE_ASH_ECHO
+ static int FAST_FUNC echocmd(int argc, char **argv)   { return echo_main(argc, argv); }
++
++/* Only options with an implemented effect can be enabled. */
++static const char shopt_names[] ALIGN1 =
++	"nullglob\0" "dotglob\0" "failglob\0";
++static const char shopt_unavailable[] ALIGN1 =
++	"globstar\0" "nocaseglob\0" "extglob\0" "expand_aliases\0" "lastpipe\0" "inherit_errexit\0" "nocasematch\0"
++	"checkwinsize\0" "histappend\0" "cmdhist\0" "extquote\0" "sourcepath\0"
++	"promptvars\0" "interactive_comments\0" "progcomp\0" "complete_fullquote\0"
++	"force_fignore\0" "hostcomplete\0" "login_shell\0" "xpg_echo\0" "patsub_replacement\0";
++
++
++static int FAST_FUNC
++shoptcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++{
++	int set = -1, quiet = 0, print = 0, opt_o = 0, status = 0, i;
++	char **ap;
++
++	while ((i = nextopt("supqo")) != '\0') {
++		if (i == 's')
++			set = 1;
++		else if (i == 'u')
++			set = 0;
++		else if (i == 'q')
++			quiet = 1;
++		else if (i == 'p')
++			print = 1;
++		else
++			opt_o = 1;
++	}
++	if (opt_o) {
++		/* shopt -o name: the set -o options */
++		for (ap = argptr; *ap; ap++) {
++			int idx = -1;
++			for (i = 0; i < NOPTS; i++)
++				if (strcmp(*ap, optnames(i)) == 0)
++					idx = i;
++			if (idx < 0) {
++				bb_error_msg("shopt: %s: invalid option name", *ap);
++				status = 1;
++				continue;
++			}
++			if (set >= 0)
++				optlist[idx] = set;
++			else if (!optlist[idx])
++				status = 1;
++		}
++		return status;
++	}
++	if (!*argptr) {
++		const char *n = shopt_names;
++		for (i = 0; *n; n += strlen(n) + 1, i++) {
++			int on = shopt_flags & (1 << i);
++			if (set < 0 || on == (set ? (1 << i) : 0))
++				out1fmt(print ? "shopt %s %s\n" : "%-16s%s\n",
++					print ? (on ? "-s" : "-u") : n, print ? n : (on ? "on" : "off"));
++		}
++		return 0;
++	}
++	for (ap = argptr; *ap; ap++) {
++		int bit = index_in_strings(shopt_names, *ap);
++		int noop = index_in_strings(shopt_unavailable, *ap);
++		int on;
++
++		if (bit < 0 && noop < 0) {
++			bb_error_msg("shopt: %s: invalid shell option name", *ap);
++			status = 1;
++			continue;
++		}
++		if (set >= 0) {
++			if (bit >= 0)
++				shopt_flags = set ? shopt_flags | (1 << bit) : shopt_flags & ~(1 << bit);
++			else if (set) {
++				bb_error_msg("shopt: %s: unavailable in this shell", *ap);
++				status = 1;
++			}
++			continue;
++		}
++		on = bit >= 0 ? (shopt_flags >> bit) & 1 : 0;
++		if (!on)
++			status = 1;
++		if (!quiet)
++			out1fmt("%-16s%s\n", *ap, on ? "on" : "off");
++	}
++	return status;
++}
++
++static void
++out1c(char c)
++{
++	char b[2] = { c, '\0' };
++	out1str(b);
++}
++
++/* "declare -p" value quoting. */
++static void
++out1_dq(const char *s)
++{
++	out1c('"');
++	for (; *s; s++) {
++		if (*s == '"' || *s == '\\' || *s == '$' || *s == '`')
++			out1c('\\');
++		out1c(*s);
++	}
++	out1c('"');
++}
++
++static int
++declare_print(const char *name)
++{
++	struct var *vp = *findvar(name);
++	char fl[8], *f = fl;
++
++	if (!vp || ((vp->flags & VUNSET) && !(vp->flags & VATTRS))) {
++		bb_error_msg("declare: %s: not found", name);
++		return 1;
++	}
++	if (vp->flags & VARRAY) *f++ = 'a';
++	if (vp->flags & VASSOC) *f++ = 'A';
++	if (vp->flags & VINTEGER) *f++ = 'i';
++	if (vp->flags & VLOWER) *f++ = 'l';
++	if (vp->flags & VREADONLY) *f++ = 'r';
++	if (vp->flags & VUPPER) *f++ = 'u';
++	if (vp->flags & VEXPORT) *f++ = 'x';
++	if (f == fl)
++		*f++ = '-';
++	*f = '\0';
++	out1fmt("declare -%s %s", fl, name);
++	if (vp->flags & (VARRAY | VASSOC)) {
++		int i, n = vp->arr ? vp->arr->n : 0;
++		if (vp->flags & VUNSET && !n) {
++			out1c('\n');
++			return 0;
++		}
++		out1str("=(");
++		for (i = 0; i < n; i++) {
++			struct arrent *e = &vp->arr->e[i];
++			if (i)
++				out1c(' ');
++			if (vp->flags & VASSOC)
++				out1fmt("[%s]=", e->key);
++			else
++				out1fmt("[" ARITH_FMT "]=", e->idx);
++			out1_dq(e->val);
++		}
++		out1str((vp->flags & VASSOC) && n ? " )\n" : ")\n");
++		return 0;
++	}
++	if (!(vp->flags & VUNSET)) {
++		out1c('=');
++		out1_dq(var_end(vp->var_text));
++	}
++	out1c('\n');
++	return 0;
++}
++
++/* declare, typeset and local. */
++static int FAST_FUNC
++declarecmd(int argc UNUSED_PARAM, char **argv)
++{
++	int is_local = argv[0][0] == 'l';
++	int on = 0, off = 0, global = 0, print = 0, funcs = 0, status = 0;
++	char **ap = argptr;
++
++	if (is_local && !funcname && !localvar_stack)
++		ash_msg_and_raise_error("not in a function");
++	for (; *ap && (**ap == '-' || **ap == '+') && (*ap)[1]; ap++) {
++		const char *o = *ap;
++		int plus = *o == '+';
++
++		if (strcmp(o, "--") == 0) {
++			ap++;
++			break;
++		}
++		for (o++; *o; o++) {
++			int f = 0;
++			switch (*o) {
++			case 'a': f = VARRAY; break;
++			case 'A': f = VASSOC; break;
++			case 'i': f = VINTEGER; break;
++			case 'l': f = VLOWER; break;
++			case 'u': f = VUPPER; break;
++			case 'r': f = VREADONLY; break;
++			case 'x': f = VEXPORT; break;
++			case 'g': global = 1; break;
++			case 'p': print = 1; break;
++			case 'f': case 'F': funcs = *o; break;
++			case 't': break;
++			case 'n':
++				bb_error_msg("%s: -n: name references are not supported; use ${!name} or eval", argv[0]);
++				return 2;
++			default:
++				bb_error_msg("%s: -%c: invalid option", argv[0], *o);
++				return 2;
++			}
++			if (plus)
++				off |= f;
++			else
++				on |= f;
++		}
++	}
++	if (!*ap) {
++		if (funcs) {
++			struct tblentry **pp, *cmdp;
++			for (pp = cmdtable; pp < &cmdtable[CMDTABLESIZE]; pp++)
++				for (cmdp = *pp; cmdp; cmdp = cmdp->next)
++					if (cmdp->cmdtype == CMDFUNCTION)
++						out1fmt("declare -f %s\n", cmdp->cmdname);
++			return 0;
++		}
++		if (print || !(on | off)) {
++			char **ep, **epend;
++			ep = listvars(0, VUNSET, NULL, &epend);
++			qsort(ep, epend - ep, sizeof(char *), vpcmp);
++			for (; ep < epend; ep++) {
++				char *nm = ckstrdup(*ep);
++				*strchrnul(nm, '=') = '\0';
++				if (print)
++					declare_print(nm);
++				else {
++					struct var *vp = *findvar(nm);
++					out1str(nm);
++					out1c('=');
++					out1str(single_quote(var_end(vp->var_text)));
++					out1c('\n');
++				}
++				free(nm);
++			}
++		}
++		return 0;
++	}
++	for (; *ap; ap++) {
++		char *text = *ap;
++		char *e = (char *)endofname(text);
++		char *name;
++		struct var *vp;
++		int has_value;
++
++		if (e == text) {
++			bb_error_msg("%s: '%s': not a valid identifier", argv[0], text);
++			status = 1;
++			continue;
++		}
++		name = ckmalloc(e - text + 1);
++		memcpy(name, text, e - text);
++		name[e - text] = '\0';
++		has_value = *e != '\0';
++		if (funcs) {
++			struct tblentry *cmdp = cmdlookup(name, 0);
++			if (cmdp && cmdp->cmdtype == CMDFUNCTION)
++				out1fmt(funcs == 'F' ? "%s\n" : "declare -f %s\n", name);
++			else
++				status = 1;
++		} else if (print && !has_value) {
++			status |= declare_print(name);
++		} else {
++			if ((is_local || (funcname && !global)) && localvar_stack)
++				mklocal(name, 0);
++			vp = *findvar(name);
++			if (!vp) {
++				/* declared, still unset, attributes kept */
++				vp = setvar(name, "", 0);
++				vp->flags |= VUNSET;
++			}
++			if ((vp->flags & VREADONLY) && (has_value || (on & ~VREADONLY))) {
++				bb_error_msg("%s: %s: readonly variable", argv[0], name);
++				status = 1;
++				free(name);
++				continue;
++			}
++			if ((on & VASSOC) && !(vp->flags & VASSOC)) {
++				if (vp->arr) {
++					bb_error_msg("%s: %s: cannot convert indexed to associative array", argv[0], name);
++					status = 1;
++					free(name);
++					continue;
++				}
++				vp->flags |= VASSOC;
++				vp->flags &= ~VARRAY;
++				arr_own(vp);
++			} else if ((on & VARRAY) && !(vp->flags & (VARRAY | VASSOC))) {
++				arr_own(vp);
++			}
++			vp->flags |= on & (VINTEGER | VLOWER | VUPPER | VEXPORT);
++			vp->flags &= ~(off & (VINTEGER | VLOWER | VUPPER | VEXPORT));
++			if (on & VLOWER)
++				vp->flags &= ~VUPPER;
++			if (on & VUPPER)
++				vp->flags &= ~VLOWER;
++			if (has_value)
++				assignword(text, 0, 0);
++			if (on & VREADONLY) {
++				vp = *findvar(name);
++				if (vp)
++					vp->flags |= VREADONLY;
++			}
++		}
++		free(name);
++	}
++	return status;
++}
++
++/* mapfile / readarray: lines of input into an array. */
++static int FAST_FUNC
++mapfilecmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++{
++	int strip = 0, fd = 0, i, n = 0, cap = 0;
++	long count = -1, skip = 0;
++	int delim = '\n';
++	const char *name = "MAPFILE";
++	char **vals = NULL;
++	struct rawbuf all = { NULL, 0, 0 };
++	char buf[4096];
++	char *p, *end;
++	ssize_t r;
++
++	while ((i = nextopt("td:n:s:u:O:C:c:")) != '\0') {
++		switch (i) {
++		case 't': strip = 1; break;
++		case 'd': delim = optionarg[0]; break;
++		case 'n': count = atol(optionarg); break;
++		case 's': skip = atol(optionarg); break;
++		case 'u': fd = atoi(optionarg); break;
++		default: break;
++		}
++	}
++	if (*argptr)
++		name = *argptr;
++	rb_put(&all, 'x');
++	all.n = 0;
++	while ((r = read(fd, buf, sizeof(buf))) != 0) {
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			break;
++		}
++		for (i = 0; i < r; i++)
++			rb_put(&all, buf[i]);
++	}
++	p = all.s;
++	end = all.s + all.n;
++	while (p < end && count != 0) {
++		char *q = memchr(p, delim, end - p);
++		char *stop = q ? q + 1 : end;
++		size_t len = (q && strip) ? (size_t)(q - p) : (size_t)(stop - p);
++
++		if (skip > 0) {
++			skip--;
++		} else {
++			if (n >= cap) {
++				cap = cap * 2 + 64;
++				vals = ckrealloc(vals, cap * sizeof(char *));
++			}
++			vals[n] = ckmalloc(len + 1);
++			memcpy(vals[n], p, len);
++			vals[n][len] = '\0';
++			n++;
++			if (count > 0)
++				count--;
++		}
++		p = stop;
++	}
++	{
++		char **keys = ckzalloc((n + 1) * sizeof(char *));
++		arr_assign(name, keys, vals, n, 0);
++		free(keys);
++	}
++	for (i = 0; i < n; i++)
++		free(vals[i]);
++	free(vals);
++	free(all.s);
++	return 0;
++}
++
++/* printf -v NAME assigns the output instead of printing it. */
++static int FAST_FUNC
++printfcmd_v(int argc, char **argv)
++{
++	int p[2], save, status;
++	char *name = argv[2], *sub;
++	struct rawbuf out = { NULL, 0, 0 };
++	char buf[1024];
++	ssize_t r;
++
++	if (!name) {
++		bb_simple_error_msg("printf: -v: option requires an argument");
++		return 2;
++	}
++	fflush_all();
++	if (pipe(p) < 0)
++		ash_msg_and_raise_perror("can't create pipe");
++	save = fcntl(1, F_DUPFD, 10);
++	dup2(p[1], 1);
++	close(p[1]);
++	argv[2] = argv[0];
++	status = printf_main(argc - 2, argv + 2);
++	argv[2] = name;
++	fflush_all();
++	dup2(save, 1);
++	close(save);
++	rb_put(&out, 'x');
++	out.n = 0;
++	out.s[0] = '\0';
++	while ((r = read(p[0], buf, sizeof(buf))) > 0) {
++		ssize_t i;
++		for (i = 0; i < r; i++)
++			rb_put(&out, buf[i]);
++	}
++	close(p[0]);
++	name = ckstrdup(name);
++	sub = split_subscript(name);
++	if (sub)
++		arr_set(name, sub, out.s, 0);
++	else
++		setvar0(name, out.s);
++	free(name);
++	free(out.s);
++	return status;
++}
++
+ #endif
+ #if ENABLE_ASH_PRINTF
+-static int FAST_FUNC printfcmd(int argc, char **argv) { return printf_main(argc, argv); }
++static int FAST_FUNC printfcmd(int argc, char **argv)
++{
++	if (argv[1] && strcmp(argv[1], "-v") == 0)
++		return printfcmd_v(argc, argv);
++	return printf_main(argc, argv);
++}
+ #endif
+ #if ENABLE_ASH_TEST || BASH_TEST2
+ static int FAST_FUNC testcmd(int argc, char **argv)   { return test_main2(&groupinfo, argc, argv); }
+@@ -10984,12 +13030,16 @@
+ 	{ BUILTIN_REGULAR       "command" +1, commandcmd },
+ #endif
+ 	{ BUILTIN_SPEC_REG      "continue"+1, breakcmd   },
++	{ BUILTIN_SPEC_REG_ASSG "declare" +1, declarecmd },
++	{ BUILTIN_REGULAR       "disown"  +1, truecmd    },
+ #if ENABLE_ASH_ECHO
+ 	{ BUILTIN_REGULAR       "echo"    +1, echocmd    },
+ #endif
+ #define EVALCMD (COMMANDCMD + \
+ 				/* command */	1 * ENABLE_ASH_CMDCMD + \
+ 				/* continue */	1 + \
++				/* declare */	1 + \
++				/* disown */	1 + \
+ 				/* echo */	1 * ENABLE_ASH_ECHO + \
+ 				0)
+ 	{ BUILTIN_SPEC_REG      "eval"    +1, NULL       }, /*evalcmd() has a differing prototype*/
+@@ -11019,16 +13069,19 @@
+ #if ENABLE_FEATURE_SH_MATH
+ 	{ BUILTIN_NOSPEC        "let"     +1, letcmd     },
+ #endif
+-	{ BUILTIN_SPEC_REG_ASSG "local"   +1, localcmd   },
++	{ BUILTIN_SPEC_REG_ASSG "local"   +1, declarecmd },
++	{ BUILTIN_REGULAR       "mapfile" +1, mapfilecmd },
+ #if ENABLE_ASH_PRINTF
+ 	{ BUILTIN_REGULAR       "printf"  +1, printfcmd  },
+ #endif
+ 	{ BUILTIN_REGULAR       "pwd"     +1, pwdcmd     },
+ 	{ BUILTIN_REGULAR       "read"    +1, readcmd    },
++	{ BUILTIN_REGULAR       "readarray"+1, mapfilecmd },
+ 	{ BUILTIN_SPEC_REG_ASSG "readonly"+1, exportcmd  },
+ 	{ BUILTIN_SPEC_REG      "return"  +1, returncmd  },
+ 	{ BUILTIN_SPEC_REG      "set"     +1, setcmd     },
+ 	{ BUILTIN_SPEC_REG      "shift"   +1, shiftcmd   },
++	{ BUILTIN_REGULAR       "shopt"   +1, shoptcmd   },
+ #if ENABLE_ASH_SLEEP
+ 	{ BUILTIN_REGULAR       "sleep"   +1, sleepcmd   },
+ #endif
+@@ -11042,6 +13095,7 @@
+ 	{ BUILTIN_SPEC_REG      "trap"    +1, trapcmd    },
+ 	{ BUILTIN_REGULAR       "true"    +1, truecmd    },
+ 	{ BUILTIN_REGULAR       "type"    +1, typecmd    },
++	{ BUILTIN_SPEC_REG_ASSG "typeset" +1, declarecmd },
+ 	{ BUILTIN_REGULAR       "ulimit"  +1, ulimitcmd  },
+ 	{ BUILTIN_REGULAR       "umask"   +1, umaskcmd   },
+ #if ENABLE_ASH_ALIAS
+@@ -11049,6 +13103,7 @@
+ #endif
+ 	{ BUILTIN_SPEC_REG      "unset"   +1, unsetcmd   },
+ 	{ BUILTIN_REGULAR       "wait"    +1, waitcmd    },
++	{ BUILTIN_REGULAR       "~time"   +1, timekwcmd  },
+ };
+ 
+ /*
+@@ -11108,6 +13163,20 @@
+ 	const char *q = endofname(p);
+ 	if (p == q)
+ 		return 0;
++	if (*q == '[') {
++		int depth = 0;
++		do {
++			if (*q == '[')
++				depth++;
++			else if (*q == ']')
++				depth--;
++			else if (!*q)
++				return 0;
++			q++;
++		} while (depth);
++	}
++	if (*q == '+')
++		q++;
+ 	return *q == '=';
+ }
+ static int FAST_FUNC
+@@ -11126,6 +13195,7 @@
+ 	struct localvar_list *localvar_stop;
+ 	struct parsefile *file_stop;
+ 	struct redirtab *redir_stop;
++	int ps_level = ++procsubst_level;
+ 	union node *argp;
+ 	struct arglist arglist;
+ 	struct arglist varlist;
+@@ -11144,6 +13214,7 @@
+ 	smallint cmd_is_exec;
+ 	int vflags;
+ 	int vlocal;
++	int dbl = 0;
+ 
+ 	errlinno = lineno = cmd->ncmd.linno;
+ 
+@@ -11201,8 +13272,12 @@
+ 				break;
+ 		}
+ 
++		/* [[ ]] operands are neither split nor globbed */
++		dbl = arglist.list && cmdentry.cmdtype == CMDBUILTIN
++			&& strcmp(arglist.list->text, "[[") == 0;
+ 		for (; argp; argp = argp->narg.next)
+ 			expandarg(argp, &arglist,
++					dbl ? EXP_TILDE :
+ 					pseudovarflag &&
+ 					isassignment(argp->narg.text) ?
+ 					EXP_VARTILDE : EXP_FULL | EXP_TILDE);
+@@ -11264,10 +13339,7 @@
+ 		spp = varlist.lastp;
+ 		expandarg(argp, &varlist, EXP_VARTILDE);
+ 
+-		if (vlocal)
+-			mklocal((*spp)->text, VEXPORT);
+-		else
+-			setvareq((*spp)->text, vflags);
++		assignword((*spp)->text, vlocal ? VEXPORT : vflags, vlocal);
+ 	}
+ 
+ 	/* Print the command if xflag is set. */
+@@ -11284,6 +13356,10 @@
+ 			char *eq = strchrnul(varval, '=');
+ 			if (*eq)
+ 				eq++;
++			if (eq[0] == '\001' && eq[1] == '(')
++				fdprintf(preverrout_fd, "%s%.*s(%s)",
++					pfx, (int)(eq - varval), varval, eq + 2);
++			else
+ 			fdprintf(preverrout_fd, "%s%.*s%s",
+ 				pfx,
+ 				(int)(eq - varval), varval,
+@@ -11411,7 +13487,7 @@
+ 		 * reaches the echo. Report it the way a path miss is reported
+ 		 * instead: a plain 127 "not found", and carry on.
+ 		 * (Delete this block if exec ever becomes possible.) */
+-		ash_msg("%s: %s", argv[0], errmsg(ENOENT, E_EXEC));
++		ash_msg("%s: %s", argv[0], strerror(ENOENT));
+ 		status = 127;
+ 		flush_stdout_stderr();
+ 		goto bail;
+@@ -11459,6 +13535,7 @@
+ 	if (cmd->ncmd.redirect)
+ 		popredir(/*drop:*/ cmd_is_exec);
+ 	unwindredir(redir_stop);
++	procsubst_done(ps_level, cmd_is_exec);
+ 	unwindfiles(file_stop);
+ 	unwindlocalvars(localvar_stop);
+ 	if (lastarg) {
+@@ -12442,6 +14519,29 @@
+ {
+ 	change_epoch(&vepochr, "%llu.%06u");
+ }
++
++/* SECONDS: whole seconds since the shell started, or since it was set
++ * (counting on from the value given). */
++static void FAST_FUNC
++change_shellsecs(const char *value)
++{
++	static long long base;
++	static smallint based;
++	struct timeval tv;
++
++	xgettimeofday(&tv);
++	if (value) {
++		base = tv.tv_sec - strtoll(value, NULL, 10);
++		based = 1;
++		return;
++	}
++	if (!based) {
++		base = tv.tv_sec;
++		based = 1;
++	}
++	setvar(vshsecs.var_text, utoa((unsigned)(tv.tv_sec - base)), VNOFUNC);
++	vshsecs.flags &= ~VNOFUNC;
++}
+ #endif
+ 
+ #if ENABLE_ASH_GETOPTS
+@@ -12588,6 +14688,11 @@
+ static char *wordtext;                 /* text of last word returned by readtoken */
+ static struct nodelist *backquotelist;
+ static union node *redirnode;
++static void compound_assign(const char *name, const char *s, int append);
++static smallint pipe_stderr;    /* the last "|" was "|&" */
++enum { RAW_PAREN, RAW_BRACKET, RAW_ARITH, RAW_WORD };
++static char *readraw(int mode);
++static union node *rawword(const char *kind, const char *raw);
+ static struct heredoc *heredoc;
+ 
+ static const char *
+@@ -12727,6 +14832,34 @@
+ }
+ 
+ static union node *
++time_cmd(const char *arg)
++{
++	union node *a0 = stzalloc(sizeof(struct narg));
++	union node *a1 = stzalloc(sizeof(struct narg));
++	union node *c = stzalloc(sizeof(struct ncmd));
++
++	a0->type = a1->type = NARG;
++	a0->narg.text = (char *)"~time";
++	a1->narg.text = (char *)arg;
++	a0->narg.next = a1;
++	c->type = NCMD;
++	c->ncmd.linno = g_parsefile->linno;
++	c->ncmd.args = a0;
++	return c;
++}
++
++static union node *
++time_semi(union node *a, union node *b)
++{
++	union node *n = stzalloc(sizeof(struct nbinary));
++
++	n->type = NSEMI;
++	n->nbinary.ch1 = a;
++	n->nbinary.ch2 = b;
++	return n;
++}
++
++static union node *
+ pipeline(void)
+ {
+ 	union node *n1, *n2, *pipenode;
+@@ -12735,6 +14868,24 @@
+ 
+ 	negate = 0;
+ 	TRACE(("pipeline: entered\n"));
++	if (readtoken() == TWORD && !quoteflag && strcmp(wordtext, "time") == 0) {
++		union node *body = NULL;
++		int posix = 0, t;
++
++		checkkwd = CHKKWD | CHKALIAS;
++		t = readtoken();
++		if (t == TWORD && !quoteflag && strcmp(wordtext, "-p") == 0) {
++			posix = 1;
++			checkkwd = CHKKWD | CHKALIAS;
++			t = readtoken();
++		}
++		tokpushback = 1;
++		if (!((1 << t) & tokendlist))
++			body = pipeline();
++		return time_semi(time_cmd("start"),
++			time_semi(body, time_cmd(posix ? "endp" : "end")));
++	}
++	tokpushback = 1;
+ 	if (readtoken() == TNOT) {
+ 		negate = !negate;
+ 		checkkwd = CHKKWD | CHKALIAS;
+@@ -12749,6 +14900,26 @@
+ 		pipenode->npipe.cmdlist = lp;
+ 		lp->n = n1;
+ 		do {
++			if (pipe_stderr) {
++				/* "a |& b" is "a 2>&1 | b" */
++				union node *r = stzalloc(sizeof(struct ndup));
++				pipe_stderr = 0;
++				r->type = NTOFD;
++				r->ndup.fd = 2;
++				r->ndup.dupfd = 1;
++				if (lp->n->type == NCMD) {
++					union node **pp = &lp->n->ncmd.redirect;
++					while (*pp)
++						pp = &(*pp)->nfile.next;
++					*pp = r;
++				} else {
++					union node *w = stzalloc(sizeof(struct nredir));
++					w->type = NREDIR;
++					w->nredir.n = lp->n;
++					w->nredir.redirect = r;
++					lp->n = w;
++				}
++			}
+ 			prev = lp;
+ 			lp = stzalloc(sizeof(struct nodelist));
+ 			checkkwd = CHKNL | CHKKWD | CHKALIAS;
+@@ -12869,6 +15040,19 @@
+ 		int t;
+ 		checkkwd = savecheckkwd;
+ 		t = readtoken();
++#if BASH_TEST2
++		if (double_brackets_flag) {
++			if (t == TLP || t == TRP) {
++				wordtext = (char *)(t == TLP ? "(" : ")");
++				t = TWORD;
++			} else if (t == TREDIR
++			 && (redirnode->type == NTO || redirnode->type == NFROM)
++			) {
++				wordtext = (char *)(redirnode->type == NTO ? ">" : "<");
++				t = TWORD;
++			}
++		}
++#endif
+ 		switch (t) {
+ #if BASH_FUNCTION
+ 		case TFUNCTION:
+@@ -12908,6 +15092,19 @@
+ 				app = &n->narg.next;
+ 				savecheckkwd = 0;
+ 			}
++#if BASH_TEST2
++			if (double_brackets_flag
++			 && (strcmp(wordtext, "=~") == 0 || strcmp(wordtext, "==") == 0
++			  || strcmp(wordtext, "!=") == 0 || strcmp(wordtext, "=") == 0)
++			) {
++				/* pattern operand: quoted parts match literally */
++				char *raw = readraw(RAW_WORD);
++				n = rawword("~", raw);
++				free(raw);
++				*app = n;
++				app = &n->narg.next;
++			}
++#endif
+ #if BASH_FUNCTION
+ 			if (function_flag) {
+ 				checkkwd = CHKNL | CHKKWD;
+@@ -13048,7 +15245,65 @@
+ 		t = TDONE;
+ 		break;
+ 	}
+-	case TFOR:
++	case TFOR: {
++		int c;
++		do
++			c = pgetc();
++		while (c == ' ' || c == '\t');
++		if (c == '(') {
++			char *raw, *part[3], *p;
++			int i, depth = 0, q = 0;
++
++			if (pgetc() != '(')
++				raise_error_syntax("bad for loop variable");
++			raw = readraw(RAW_ARITH);
++			part[0] = p = raw;
++			for (i = 1; *p; p++) {
++				if (q) {
++					if (*p == q)
++						q = 0;
++					else if (*p == '\\' && q == '"' && p[1])
++						p++;
++				} else if (*p == '\'' || *p == '"')
++					q = *p;
++				else if (*p == '(')
++					depth++;
++				else if (*p == ')')
++					depth--;
++				else if (*p == ';' && depth == 0) {
++					if (i == 3)
++						raise_error_syntax("bad for loop");
++					*p = '\0';
++					part[i++] = p + 1;
++				}
++			}
++			if (i != 3)
++				raise_error_syntax("bad for loop");
++			n1 = stzalloc(sizeof(struct nfor));
++			n1->type = NFOR;
++			n1->nfor.linno = savelinno;
++			n1->nfor.var = (char *)"((";
++			n1->nfor.args = rawword("", part[0]);
++			n1->nfor.args->narg.next = rawword("", part[1]);
++			n1->nfor.args->narg.next->narg.next = rawword("", part[2]);
++			free(raw);
++			checkkwd = CHKNL | CHKKWD | CHKALIAS;
++			t = readtoken();
++			if (t == TSEMI) {
++				checkkwd = CHKNL | CHKKWD | CHKALIAS;
++				t = readtoken();
++			}
++			if (t == TDO)
++				t = TDONE;
++			else if (t == TBEGIN)
++				t = TEND;
++			else
++				raise_error_unexpected_syntax(TDO);
++			n1->nfor.body = list(0);
++			break;
++		}
++		pungetc();
++	}
+ 		if (readtoken() != TWORD || quoteflag || !goodname(wordtext))
+ 			raise_error_syntax("bad for loop variable");
+ 		n1 = stzalloc(sizeof(struct nfor));
+@@ -13144,6 +15399,19 @@
+ 		*cpp = NULL;
+ 		goto redir;
+ 	case TLP:
++		if (pgetc() == '(') {
++			char *raw = readraw(RAW_ARITH);
++			n1 = stzalloc(sizeof(struct ncmd));
++			n1->type = NCMD;
++			n1->ncmd.linno = savelinno;
++			n1->ncmd.args = n2 = stzalloc(sizeof(struct narg));
++			n2->type = NARG;
++			n2->narg.text = (char *)"let";
++			n2->narg.next = rawword("", raw);
++			free(raw);
++			goto redir;
++		}
++		pungetc();
+ 		n1 = stzalloc(sizeof(struct nredir));
+ 		n1->type = NSUBSHELL;
+ 		n1->nredir.linno = savelinno;
+@@ -13235,6 +15503,186 @@
+ 	return c;
+ }
+ #endif
++
++/* ---- text kept as written ----
++ * Array subscripts, compound assignments, (( )) and the regex after =~ do
++ * not follow the word rules of the rest of the line. Their text is kept as
++ * written (each byte with the high bit set escaped by CTLESC) inside a
++ * CTLVAR VSRAW ... CTLENDVAR group, and parsed when it is used. */
++/* Reads up to the closing delimiter: the ')' or ']' that balances one
++ * already read, "))" for arithmetic, or the end of a word (RAW_WORD). */
++static char *
++readraw(int mode)
++{
++	struct rawbuf rb = { NULL, 0, 0 };
++	int depth = 0, atword = 1, c;
++
++	rb_put(&rb, 'x');
++	rb.n = 0;
++	rb.s[0] = '\0';
++	if (mode == RAW_WORD) {
++		do
++			c = pgetc();
++		while (c == ' ' || c == '\t');
++		pungetc();
++	}
++	for (;;) {
++		c = pgetc();
++		if (c == PEOF) {
++			if (mode == RAW_WORD)
++				break;
++			raise_error_syntax(mode == RAW_BRACKET ? "missing ']'" : "missing ')'");
++		}
++		if (mode == RAW_WORD && (c == ' ' || c == '\t' || c == '\n' || (c == ')' && depth == 0))) {
++			pungetc();
++			break;
++		}
++		if (c == '\n')
++			nlnoprompt();
++		if (c == '\\') {
++			c = pgetc();
++			if (c == '\n') {
++				nlnoprompt();
++				continue;
++			}
++			rb_put(&rb, '\\');
++			if (c == PEOF)
++				break;
++			rb_put(&rb, c);
++			atword = 0;
++			continue;
++		}
++		if (c == '\'' || c == '"' || c == '`') {
++			int q = c;
++			rb_put(&rb, c);
++			for (;;) {
++				c = pgetc();
++				if (c == PEOF)
++					raise_error_syntax("unterminated quoted string");
++				if (c == '\n')
++					nlnoprompt();
++				rb_put(&rb, c);
++				if (c == q)
++					break;
++				if (c == '\\' && q != '\'') {
++					c = pgetc();
++					if (c == PEOF)
++						raise_error_syntax("unterminated quoted string");
++					rb_put(&rb, c);
++				}
++			}
++			atword = 0;
++			continue;
++		}
++		if (c == '#' && atword && mode == RAW_PAREN) {
++			while ((c = pgetc()) != '\n' && c != PEOF)
++				continue;
++			if (c == '\n')
++				nlnoprompt();
++			rb_put(&rb, '\n');
++			continue;
++		}
++		atword = (c == ' ' || c == '\t' || c == '\n');
++		if (mode == RAW_BRACKET) {
++			if (c == '[')
++				depth++;
++			else if (c == ']' && depth-- == 0)
++				break;
++		} else {
++			if (c == '(')
++				depth++;
++			else if (c == ')' && depth-- == 0) {
++				if (mode != RAW_ARITH)
++					break;
++				if (pgetc() == ')')
++					break;
++				raise_error_syntax("missing '))'");
++			}
++		}
++		rb_put(&rb, c);
++	}
++	return rb.s;
++}
++
++static char *
++putraw(char *out, const char *s)
++{
++	for (; *s; s++) {
++		if ((unsigned char)*s & 0x80)
++			STPUTC(CTLESC, out);
++		STPUTC(*s, out);
++	}
++	return out;
++}
++
++/* A word that parses and expands raw when used: kind "" is a double-quoted
++ * word, "~" a regex (quoted parts literal), "(" a list kept unexpanded. */
++static char *
++rawword_put(char *out, const char *kind, const char *raw)
++{
++	STPUTC(CTLQUOTEMARK, out);
++	STPUTC(CTLVAR, out);
++	STPUTC(VSRAW, out);
++	while (*kind)
++		STPUTC(*kind++, out);
++	STPUTC('=', out);
++	out = putraw(out, raw);
++	STPUTC(CTLENDVAR, out);
++	STPUTC(CTLQUOTEMARK, out);
++	return out;
++}
++
++static union node *
++rawword(const char *kind, const char *raw)
++{
++	union node *n;
++	char *out, *text;
++
++	STARTSTACKSTR(out);
++	out = rawword_put(out, kind, raw);
++	STPUTC('\0', out);
++	text = grabstackstr(out);
++	n = stzalloc(sizeof(struct narg));
++	n->type = NARG;
++	n->narg.text = text;
++	return n;
++}
++
++/* "name=" or "name+=" with nothing else: a compound assignment follows. */
++static int
++compound_prefix(const char *s, const char *e)
++{
++	if (e - s < 2 || e[-1] != '=' || !is_name(*s))
++		return 0;
++	e--;
++	if (e[-1] == '+')
++		e--;
++	for (; s < e; s++)
++		if (!is_in_name(*s))
++			return 0;
++	return 1;
++}
++
++/* "name[" with the bracket still open. */
++static int
++open_subscript(const char *s, const char *e)
++{
++	int depth = 0;
++
++	if (s >= e || !is_name(*s))
++		return 0;
++	while (s < e && is_in_name(*s))
++		s++;
++	if (s >= e || *s != '[')
++		return 0;
++	for (; s < e; s++) {
++		if (*s == '[')
++			depth++;
++		else if (*s == ']')
++			depth--;
++	}
++	return depth > 0;
++}
+ 
+ /* Used by expandstr to get here-doc like behaviour. */
+ #define FAKEEOFMARK ((struct heredoc*)(uintptr_t)1)
+@@ -13446,6 +15894,23 @@
+ 			goto endword;           /* exit outer loop */
+ 		default:
+ 			if (synstack->varnest == 0) {
++				if ((c == ' ' || c == '	') && eofmark == NULL
++				 && synstack->syntax == BASESYNTAX
++				 && open_subscript(stackblock(), out)
++				) {
++					/* name[key with spaces]=value */
++					USTPUTC(c, out);
++					break;
++				}
++				if (c == '(' && eofmark == NULL && synstack->syntax == BASESYNTAX
++				 && compound_prefix(stackblock(), out)
++				) {
++					char *raw = readraw(RAW_PAREN);
++					out = rawword_put(out, "(", raw);
++					free(raw);
++					quotef = 1;
++					break;
++				}
+ #if BASH_REDIR_OUTPUT
+ 				if (c == '&') {
+ //Can't call pgetc_eatbnl() here, this requires three-deep pungetc()
+@@ -13664,6 +16129,9 @@
+ parsesub: {
+ 	unsigned char subtype;
+ 	int typeloc;
++	unsigned char vsflags = 0;
++	char *subscr = NULL;
++	char casemod[2] = { 0, 0 };
+ 
+ 	c = pgetc_eatbnl();
+ 	if ((checkkwd & CHKEOFMARK)
+@@ -13699,6 +16167,15 @@
+ 		if (c == '{') {
+ 			c = pgetc_eatbnl();
+ 			subtype = 0;
++			if (c == '!') {
++				c = pgetc_eatbnl();
++				if (is_name(c))
++					vsflags |= VSINDIR;
++				else {
++					pungetc();
++					c = '!';
++				}
++			}
+ 		}
+  varname:
+ 		if (is_name(c)) {
+@@ -13707,6 +16184,21 @@
+ 				STPUTC(c, out);
+ 				c = pgetc_eatbnl();
+ 			} while (is_in_name(c));
++			if (subtype == 0 || subtype == VSLENGTH) {
++				if (c == '[') {
++					subscr = readraw(RAW_BRACKET);
++					c = pgetc_eatbnl();
++				} else if ((vsflags & VSINDIR) && (c == '*' || c == '@')) {
++					int cc = c;
++					c = pgetc_eatbnl();
++					if (c == '}')
++						STPUTC(cc, out);
++					else {
++						pungetc();
++						c = cc;
++					}
++				}
++			}
+ 		} else if (isdigit(c)) {
+ 			/* $[{[#]]NUM[}] */
+ 			do {
+@@ -13771,6 +16263,18 @@
+ 				subtype |= p - types + VSNORMAL;
+ 				break;
+ 			}
++			case '^':
++			case ',':
++			case '@':
++				casemod[0] = c;
++				c = pgetc_eatbnl();
++				if (cc == '@' || c == cc)
++					casemod[1] = c;
++				else
++					pungetc();
++				subtype = VSCASE;
++				newsyn = BASESYNTAX;
++				break;
+ 			case '%':
+ 			case '#':
+ 				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
+@@ -13818,13 +16322,23 @@
+ 			synstack->dblquote = newsyn != BASESYNTAX;
+ 		}
+ 
+-		((unsigned char *)stackblock())[typeloc] = subtype;
++		((unsigned char *)stackblock())[typeloc] = subtype | vsflags | (subscr ? VSSUBSCR : 0);
+ 		if (subtype != VSNORMAL) {
+ 			synstack->varnest++;
+ 			if (synstack->dblquote)
+ 				synstack->dqvarnest++;
+ 		}
+ 		STPUTC('=', out);
++		if (subscr) {
++			out = putraw(out, subscr);
++			STPUTC(CTLENDVAR, out);
++			free(subscr);
++		}
++		if (casemod[0]) {
++			STPUTC(casemod[0], out);
++			if (casemod[1])
++				STPUTC(casemod[1], out);
++		}
+ 	}
+ 	goto parsesub_return;
+ }
+@@ -14047,6 +16561,8 @@
+ 					int cc = pgetc_eatbnl();
+ 					if (cc == c) {    /* double occurrence? */
+ 						p += xxreadtoken_doubles + 1;
++					} else if (c == '|' && cc == '&') {
++						pipe_stderr = 1;
+ 					} else {
+ 						pungetc();
+ #if BASH_REDIR_OUTPUT
+@@ -14231,6 +16747,426 @@
+ 	}
+ }
+ 
++/* The end of the quoted part or substitution that starts at s. */
++static const char *
++rawskip(const char *s)
++{
++	char open, close;
++	int depth;
++
++	if (*s == '\'') {
++		s = strchrnul(s + 1, '\'');
++		return *s ? s + 1 : s;
++	}
++	if (*s == '"' || *s == '`') {
++		char q = *s++;
++		while (*s && *s != q) {
++			if (*s == '\\' && s[1])
++				s += 2;
++			else if (q == '"' && (*s == '`' || (*s == '$' && (s[1] == '(' || s[1] == '{'))))
++				s = rawskip(s);
++			else
++				s++;
++		}
++		return *s ? s + 1 : s;
++	}
++	open = s[1];
++	close = open == '(' ? ')' : '}';
++	s += 2;
++	depth = 1;
++	while (*s) {
++		if (*s == '\\' && s[1]) {
++			s += 2;
++			continue;
++		}
++		if (*s == '\'' || *s == '"' || *s == '`'
++		 || (*s == '$' && (s[1] == '(' || s[1] == '{'))
++		) {
++			s = rawskip(s);
++			continue;
++		}
++		if (*s == open)
++			depth++;
++		else if (*s == close && --depth == 0)
++			return s + 1;
++		s++;
++	}
++	return s;
++}
++
++static void
++rb_dq(struct rawbuf *rb, int c, int regex)
++{
++	if (regex && strchr("\\^$.|?*+()[]{}", c)) {
++		rb_put(rb, '\\');
++		rb_put(rb, '\\');
++	}
++	if (c == '$' || c == '`' || c == '"' || c == '\\')
++		rb_put(rb, '\\');
++	rb_put(rb, c);
++}
++
++/* Rewrites shell text as the body of a double-quoted word: quoted parts
++ * become literal text (and, for a regex, literal regex text), while
++ * substitutions stay as written. */
++static char *
++dqify(const char *s, int regex)
++{
++	struct rawbuf rb = { NULL, 0, 0 };
++	const char *e;
++
++	rb_put(&rb, 'x');
++	rb.n = 0;
++	rb.s[0] = '\0';
++	while (*s) {
++		if (*s == '\'' || *s == '"') {
++			const char *in = s + 1, *end;
++			e = rawskip(s);
++			end = (e > in && e[-1] == *s) ? e - 1 : e;
++			if (*s == '\'') {
++				for (; in < end; in++)
++					rb_dq(&rb, (unsigned char)*in, regex);
++			} else if (regex) {
++				char *body = ckmalloc(end - in + 1), *v, *q;
++				memcpy(body, in, end - in);
++				body[end - in] = '\0';
++				v = rawexpand(body, DQSYNTAX, EXP_QUOTED, NULL, 1);
++				for (q = v; *q; q++)
++					rb_dq(&rb, (unsigned char)*q, 1);
++				free(v);
++				free(body);
++			} else {
++				for (; in < end; in++)
++					rb_put(&rb, *in);
++			}
++			s = e;
++		} else if (*s == '\\' && s[1]) {
++			if (regex)
++				rb_dq(&rb, (unsigned char)s[1], 1);
++			else {
++				if (strchr("$`\"\\", s[1]))
++					rb_put(&rb, '\\');
++				rb_put(&rb, s[1]);
++			}
++			s += 2;
++		} else if (*s == '`' || (*s == '$' && (s[1] == '(' || s[1] == '{'))) {
++			e = rawskip(s);
++			while (s < e)
++				rb_put(&rb, *s++);
++		} else {
++			rb_put(&rb, *s++);
++		}
++	}
++	return rb.s;
++}
++
++/*
++ * Parses src as one word and expands it. Returns the fields as consecutive
++ * NUL-terminated strings in one malloc'd block (at least one, possibly
++ * empty, string), their count in *np. inword: called while a word is being
++ * expanded, whose partial result on the stack must survive.
++ */
++static char *
++rawexpand(const char *src, int syntax, int flag, int *np, int inword)
++{
++	struct parsefile *file_stop = g_parsefile;
++	struct jmploc *volatile savehandler = exception_handler;
++	struct jmploc jmploc;
++	struct heredoc *saveheredoclist = heredoclist;
++	int saveprompt = doprompt;
++	struct stackmark smark;
++	int startloc = inword ? expdest - (char *)stackblock() : 0;
++	struct ifsregion savefirst = ifsfirst;
++	struct ifsregion *savelast = ifslastp;
++	struct arglist saveexparg = exparg;
++	struct nodelist *saveargbackq = argbackq;
++	char *savewordtext = wordtext;
++	struct nodelist *savebq = backquotelist;
++	int savetokpushback = tokpushback;
++	int savelasttoken = lasttoken;
++	int savequoteflag = quoteflag;
++	int savecheckkwd = checkkwd;
++	char *volatile out = NULL;
++	volatile int n = 0;
++	int err;
++
++	pushstackmark(&smark, startloc);
++	ifsfirst.next = NULL;
++	ifslastp = NULL;
++	tokpushback = 0;
++	checkkwd = 0;
++	setinputstring((char *)src);
++	heredoclist = NULL;
++	doprompt = 0;
++	err = setjmp(jmploc.loc);
++	if (!err) {
++		union node a;
++		struct arglist al;
++		struct strlist *sp;
++		size_t len = 1;
++		char *q;
++
++		exception_handler = &jmploc;
++		readtoken1(pgetc_eatbnl(), syntax, syntax == BASESYNTAX ? NULL : FAKEEOFMARK);
++		a.narg.type = NARG;
++		a.narg.next = NULL;
++		a.narg.text = wordtext;
++		a.narg.backquote = backquotelist;
++		al.lastp = &al.list;
++		expandarg(&a, &al, flag);
++		*al.lastp = NULL;
++		for (sp = al.list; sp; sp = sp->next)
++			len += strlen(sp->text) + 1;
++		out = q = ckmalloc(len);
++		*q = '\0';
++		for (sp = al.list; sp; sp = sp->next) {
++			q = stpcpy(q, sp->text) + 1;
++			n++;
++		}
++	}
++	exception_handler = savehandler;
++	unwindfiles(file_stop);
++	heredoclist = saveheredoclist;
++	doprompt = saveprompt;
++	wordtext = savewordtext;
++	backquotelist = savebq;
++	tokpushback = savetokpushback;
++	lasttoken = savelasttoken;
++	quoteflag = savequoteflag;
++	checkkwd = savecheckkwd;
++	ifsfree();
++	ifsfirst = savefirst;
++	ifslastp = savelast;
++	exparg = saveexparg;
++	argbackq = saveargbackq;
++	popstackmark(&smark);
++	if (inword)
++		expdest = (char *)stackblock() + startloc;
++	if (err) {
++		free(out);
++		longjmp(exception_handler->loc, 1);
++	}
++	if (np)
++		*np = n;
++	return out;
++}
++
++/* Raw text expanded like a double-quoted word. */
++static char *
++rawdq(const char *raw, int inword)
++{
++	char *dq = dqify(raw, 0);
++	char *r = rawexpand(dq, DQSYNTAX, EXP_QUOTED, NULL, inword);
++	free(dq);
++	return r;
++}
++
++/* The pattern after =~: quoted parts match literally. */
++static char *
++rawregex(const char *raw)
++{
++	char *dq = dqify(raw, 1);
++	char *r = rawexpand(dq, DQSYNTAX, EXP_QUOTED, NULL, 1);
++	free(dq);
++	return r;
++}
++
++/* The elements of a name=( ... ) list, assigned. */
++static void
++compound_assign(const char *name, const char *s, int append)
++{
++	char **keys = NULL, **vals = NULL;
++	int n = 0, cap = 0, i;
++
++	for (;;) {
++		const char *start;
++		char *word;
++
++		while (*s == ' ' || *s == '\t' || *s == '\n')
++			s++;
++		if (!*s)
++			break;
++		start = s;
++		if (*s == '[') {
++			/* [key with spaces]=value */
++			int depth = 0;
++			do {
++				if (*s == '\\' && s[1])
++					s++;
++				else if (*s == '\'' || *s == '"')
++					s = rawskip(s) - 1;
++				else if (*s == '[')
++					depth++;
++				else if (*s == ']')
++					depth--;
++				s++;
++			} while (*s && depth);
++		}
++		while (*s && *s != ' ' && *s != '\t' && *s != '\n') {
++			if (*s == '\\' && s[1])
++				s += 2;
++			else if (*s == '\'' || *s == '"' || *s == '`'
++			 || (*s == '$' && (s[1] == '(' || s[1] == '{'))
++			)
++				s = rawskip(s);
++			else
++				s++;
++		}
++		word = ckmalloc(s - start + 1);
++		memcpy(word, start, s - start);
++		word[s - start] = '\0';
++		if (n + 64 > cap) {
++			cap = cap * 2 + 64;
++			keys = ckrealloc(keys, cap * sizeof(char *));
++			vals = ckrealloc(vals, cap * sizeof(char *));
++		}
++		if (word[0] == '[') {
++			const char *q = word + 1;
++			int depth = 1;
++
++			while (*q) {
++				if (*q == '\\' && q[1])
++					q += 2;
++				else if (*q == '\'' || *q == '"' || *q == '`'
++				 || (*q == '$' && (q[1] == '(' || q[1] == '{'))
++				)
++					q = rawskip(q);
++				else if (*q == '[')
++					depth++, q++;
++				else if (*q == ']' && --depth == 0)
++					break;
++				else
++					q++;
++			}
++			if (*q == ']' && (q[1] == '=' || (q[1] == '+' && q[2] == '='))) {
++				char *k = ckmalloc(q - word);
++				memcpy(k, word + 1, q - word - 1);
++				k[q - word - 1] = '\0';
++				keys[n] = rawdq(k, 0);
++				free(k);
++				vals[n] = rawexpand(q + (q[1] == '+' ? 3 : 2), BASESYNTAX, EXP_TILDE, NULL, 0);
++				n++;
++				free(word);
++				continue;
++			}
++		}
++		{
++			int nf;
++			char *f = rawexpand(word, BASESYNTAX, EXP_FULL | EXP_TILDE, &nf, 0);
++			char *q = f;
++
++			if (n + nf > cap) {
++				cap = n + nf + 64;
++				keys = ckrealloc(keys, cap * sizeof(char *));
++				vals = ckrealloc(vals, cap * sizeof(char *));
++			}
++			for (i = 0; i < nf; i++) {
++				keys[n] = NULL;
++				vals[n++] = ckstrdup(q);
++				q += strlen(q) + 1;
++			}
++			free(f);
++		}
++		free(word);
++	}
++	arr_assign(name, keys, vals, n, append);
++	for (i = 0; i < n; i++) {
++		free(keys[i]);
++		free(vals[i]);
++	}
++	free(keys);
++	free(vals);
++}
++
++/* One expanded assignment word: name=v, name+=v, name[k]=v, name=(...). */
++static void
++assignword(char *text, int flags, int local)
++{
++	char *e = (char *)endofname(text);
++	char *sub = NULL, *val, *name;
++	int append = 0, compound;
++	struct var *vp;
++
++	if (*e == '[') {
++		char *q = e + 1;
++		int depth = 1;
++		while (*q && depth) {
++			if (*q == '[')
++				depth++;
++			else if (*q == ']')
++				depth--;
++			q++;
++		}
++		sub = ckmalloc(q - e);
++		memcpy(sub, e + 1, q - e - 2);
++		sub[q - e - 2] = '\0';
++		val = q;
++	} else
++		val = e;
++	if (*val == '+') {
++		append = 1;
++		val++;
++	}
++	if (*val == '=')
++		val++;
++	compound = val[0] == '\001' && val[1] == '(';
++	name = ckmalloc(e - text + 1);
++	memcpy(name, text, e - text);
++	name[e - text] = '\0';
++	vp = *findvar(name);
++	if (!sub && !append && !compound
++	 && !(vp && (vp->flags & (VINTEGER | VLOWER | VUPPER)))
++	) {
++		if (local)
++			mklocal(text, flags);
++		else
++			setvareq(text, flags);
++		free(name);
++		return;
++	}
++	if (local)
++		mklocal(name, flags);
++	if (compound)
++		compound_assign(name, val + 2, append);
++	else if (sub)
++		arr_set(name, sub, val, append);
++	else {
++		vp = *findvar(name);
++		if (vp && vp->arr)
++			arr_set(name, "0", val, append);
++		else {
++			char *nv = attr_value(vp ? vp->flags : 0, lookupvar(name), val, append);
++			setvar(name, nv, flags);
++			free(nv);
++		}
++	}
++	free(sub);
++	free(name);
++}
++
++#if BASH_TEST2
++/* [[ s =~ re ]] leaves the match and its groups in BASH_REMATCH. */
++void
++test_rematch(const char *s, const regmatch_t *m, int n)
++{
++	char *vals[10], *keys[10];
++	int i, k = 0;
++
++	if (m) {
++		for (i = 0; i < n && i < 10; i++) {
++			size_t len = m[i].rm_so < 0 ? 0 : m[i].rm_eo - m[i].rm_so;
++			vals[k] = ckmalloc(len + 1);
++			memcpy(vals[k], m[i].rm_so < 0 ? "" : s + m[i].rm_so, len);
++			vals[k][len] = '\0';
++			keys[k++] = NULL;
++		}
++	}
++	arr_assign("BASH_REMATCH", keys, vals, k, 0);
++	for (i = 0; i < k; i++)
++		free(vals[i]);
++}
++#endif
++
+ static const char *
+ expandstr(const char *ps, int syntax_type)
+ {
+@@ -14405,6 +17341,7 @@
+ 			inter++;
+ 			chkmail();
+ 		}
++		intr_base = __host_interrupt();
+ 		n = parsecmd(inter);
+ #if DEBUG
+ 		if (DEBUG > 2 && debug && (n != NODE_EOF))
+@@ -14788,13 +17725,49 @@
+ 
+ 	for (ap = argptr; *ap; ap++) {
+ 		if (flag != 'f') {
+-			unsetvar(*ap);
++			char *sub;
++			if (strchr(*ap, '[') && (sub = split_subscript(*ap)) != NULL)
++				arr_unset(*ap, sub);
++			else
++				unsetvar(*ap);
+ 			continue;
+ 		}
+ 		if (flag != 'v')
+ 			unsetfunc(*ap);
+ 	}
+ 	return 0;
++}
++
++/* The two halves of the "time" keyword, which the parser places around the
++ * pipeline it times. Only wall-clock time is measurable here. */
++static int FAST_FUNC
++timekwcmd(int argc UNUSED_PARAM, char **argv)
++{
++	static struct timespec started[32];
++	static int depth;
++	int status = exitstatus;
++	struct timespec now;
++	long long ms;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	if (strcmp(argv[1], "start") == 0) {
++		if (depth < 32)
++			started[depth] = now;
++		depth++;
++		return status;
++	}
++	if (depth == 0)
++		return status;
++	depth--;
++	if (depth >= 32)
++		return status;
++	ms = (now.tv_sec - started[depth].tv_sec) * 1000LL
++		+ (now.tv_nsec - started[depth].tv_nsec) / 1000000;
++	if (argv[1][3] == 'p')
++		fprintf(stderr, "real %lld.%02lld\n", ms / 1000, ms % 1000 / 10);
++	else
++		fprintf(stderr, "\nreal\t%lldm%lld.%03llds\n", ms / 60000, ms / 1000 % 60, ms % 1000);
++	return status;
+ }
+ 
+ static const unsigned char timescmd_str[] ALIGN1 = {
+@@ -14864,21 +17837,36 @@
+  *      -u FD           Read from given FD instead of fd 0
+  *      -d DELIM        End on DELIM char, not newline
+  * This uses unbuffered input, which may be avoidable in some cases.
++ *      -a ARRAY        Read the fields into an array
+  * TODO: bash also has:
+- *      -a ARRAY        Read into array[0],[1],etc
+  *      -e              Use line editing (tty only)
+  */
++static char **read_fields;
++static int read_nfields;
++
++static void FAST_FUNC
++read_collect(const char *name UNUSED_PARAM, const char *val)
++{
++	read_fields = ckrealloc(read_fields, (read_nfields + 1) * sizeof(char *));
++	read_fields[read_nfields++] = ckstrdup(val);
++}
++
+ static int FAST_FUNC
+ readcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
+ {
+ 	struct builtin_read_params params;
+ 	const char *r;
+ 	int i;
++	char *arrname = NULL;
++	char **dummy = NULL;
+ 
+ 	memset(&params, 0, sizeof(params));
+ 
+-	while ((i = nextopt("p:u:rt:n:sd:")) != '\0') {
++	while ((i = nextopt("p:u:rt:n:sd:a:")) != '\0') {
+ 		switch (i) {
++		case 'a':
++			arrname = optionarg;
++			break;
+ 		case 'p':
+ 			params.opt_p = optionarg;
+ 			break;
+@@ -14914,6 +17902,18 @@
+ 	params.argv = argptr;
+ 	params.setvar = setvar0;
+ 	params.ifs = bltinlookup("IFS"); /* can be NULL */
++	if (arrname) {
++		/* one name per field; the fields past the line come back empty */
++		int k;
++		dummy = ckmalloc(1025 * sizeof(char *));
++		for (k = 0; k < 1024; k++)
++			dummy[k] = (char *)"_";
++		dummy[1024] = NULL;
++		params.argv = dummy;
++		params.setvar = read_collect;
++		read_fields = NULL;
++		read_nfields = 0;
++	}
+ 
+ 	/* "read -s" needs to save/restore termios, can't allow ^C
+ 	 * to jump out of it.
+@@ -14929,6 +17929,22 @@
+ 		 */
+ 		if (pending_sig == 0)
+ 			goto again;
++	}
++
++	if (arrname) {
++		char **keys;
++		int k;
++		while (read_nfields > 0 && !read_fields[read_nfields - 1][0])
++			free(read_fields[--read_nfields]);
++		keys = ckzalloc((read_nfields + 1) * sizeof(char *));
++		arr_assign(arrname, keys, read_fields, read_nfields, 0);
++		for (k = 0; k < read_nfields; k++)
++			free(read_fields[k]);
++		free(read_fields);
++		free(keys);
++		free(dummy);
++		read_fields = NULL;
++		read_nfields = 0;
+ 	}
+ 
+ 	if ((uintptr_t)r == 2) /* -t SEC timeout? */
+@@ -15096,6 +18112,7 @@
+ 		/*free(p); - we'll exit soon */
+ 	}
+  out:
++	procsubst_run(0);
+ 	exitreset();
+ 	/* dash wraps setjobctl(0) in "if (setjmp(loc.loc) == 0) {...}".
+ 	 * our setjobctl(0) does not panic if tcsetpgrp fails inside it.
+@@ -15340,6 +18357,13 @@
+ 	rootpid = getpid();
+ 
+ 	init();
++	setvar0("BASH_VERSION", "5.2.0(1)-release");
++	{
++		static const char *const vers[] = { "5", "2", "0", "1", "release", "wasm32-unknown-wasi" };
++		char *keys[6] = { NULL };
++		arr_assign("BASH_VERSINFO", keys, (char **)vers, 6, 0);
++		change_shellsecs(NULL);
++	}
+ 	setstackmark(&smark);
+ 
+ #if NUM_SCRIPTS > 0
+@@ -15388,7 +18412,7 @@
+ 		// ^^ not necessary since now we special-case fd 0
+ 		// in save_fd_on_redirect()
+ 
+-		lineno = 0; // bash compat
++		lineno = 1;
+ 		// dash: evalstring(minusc, sflag ? 0 : EV_EXIT);
+ 		// The above makes
+ 		//  ash -sc 'echo $-'
+--- a/shell/math.c
++++ b/shell/math.c
+@@ -267,6 +267,29 @@
+ 
+ static arith_t
+ evaluate_string(arith_state_t *math_state, const char *expr);
++
++/* A name may carry an array subscript: "a[i+1]". */
++static const char *
++arith_endofname(const char *p)
++{
++	const char *e = endofname(p);
++	const char *q;
++	int depth = 0;
++
++	if (e == p || *e != '[')
++		return e;
++	q = e;
++	do {
++		if (*q == '[')
++			depth++;
++		else if (*q == ']')
++			depth--;
++		else if (!*q)
++			return e;
++		q++;
++	} while (depth);
++	return q;
++}
+ 
+ static arith_t
+ arith_lookup_val(arith_state_t *math_state, const char *name, char *endname)
+@@ -479,7 +502,7 @@
+ 		/* Save to shell variable */
+ 		sprintf(buf, ARITH_FMT, rez);
+ 		{
+-			char *e = (char*)endofname(top_of_stack->var_name);
++			char *e = (char*)arith_endofname(top_of_stack->var_name);
+ 			char c = *e;
+ 			*e = '\0';
+ 			math_state->setvar(top_of_stack->var_name, buf);
+@@ -733,7 +756,7 @@
+ 			return numstack->val;
+ 		}
+ 
+-		p = endofname(expr);
++		p = arith_endofname(expr);
+ 		if (p != expr) {
+ 			/* Name */
+ 			if (!math_state->evaluation_disabled) {

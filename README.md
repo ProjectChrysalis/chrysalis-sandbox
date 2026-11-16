@@ -34,21 +34,42 @@ Git includes two-commit `merge-base` (`--all` and `--is-ancestor`) and
 checks use the repository's index, `.gitignore` files, `.git/info/exclude`
 and its configured `core.excludesFile`, all inside the virtual filesystem.
 Other merge-base modes are refused explicitly. `reflog`, `symbolic-ref` and
-`count-objects` read the repository directly. The shell remains busybox
-ash; GNU-only options are not universal (use `ls -l --full-time` for full
-timestamps). `rg` searches piped or redirected input, or explicit `-`,
-without scanning the workspace. Whole-second `sleep` waits are honored;
-fractional durations are not enabled in this BusyBox build (use Python
-`time.sleep` when a script needs subsecond timing).
+`count-objects` read the repository directly. `rg` searches piped or
+redirected input, or explicit `-`, without scanning the workspace.
 
-`/dev/zero`, `/dev/random` and `/dev/urandom` read as expected. `touch`
-is the runtime's own, so it works from `xargs` and `find -exec` too.
+The development shell supports process substitution (`<(...)`, `>(...)`),
+indexed and associative arrays, brace expansion, `[[ ]]`, arithmetic commands
+and loops, regex captures, case conversion, `mapfile`, `read -a`, `printf -v`
+and `%q`. `PIPESTATUS` and `set -o pipefail` report pipeline results.
+`shopt` implements `nullglob`, `dotglob` and `failglob`; unavailable options
+such as `globstar` and `extglob` fail explicitly when enabled. Name references
+(`declare -n`) are unavailable. `column` formats tables and lists; `less` and
+`more` emit their input without waiting for terminal interaction. Interactive
+editors and process-table commands report their limits explicitly. GNU-only command options are not universal
+(use `ls -l --full-time` for full timestamps).
 
-Process substitution (`<(...)`, `>(...)`) and detached/background processes
-are unavailable. Compare temporary files instead. `timeout` and `nohup`
-return an explicit error without running the command. Use the embedder’s
-per-command timeout; it stops the worker and starts a fresh one for the next
-command, discarding unsaved changes and scratch files.
+Fractional `sleep` durations work. `date -d` and `touch -d` accept relative
+dates such as `yesterday` and `2 days ago`. `/dev/zero`, `/dev/random` and
+`/dev/urandom` read as expected. `touch`, `mktemp` and `nproc` run through the
+host command bridge, including from `xargs` and `find -exec`. Temporary files
+use mode 0600 and directories 0700. `nproc` reports the one worker executing
+commands, independently of the computer's core count.
+
+There is no fork or concurrent process scheduler. Background jobs finish
+before the next command runs; `$!` and `wait` refer to those completed jobs.
+`nohup` runs its command in the current session. Pipeline stages and process
+substitutions use buffered pipes, limited to 64 MiB or one million writes.
+Exceeding a pipe limit stops its writer with status 141 and a diagnostic.
+Brace expansions over 100,000 words fail rather than returning a partial list.
+
+`timeout` enforces cooperative deadlines for shell loops and applets,
+including nested shells. It cannot forcibly interrupt arbitrary Python or
+JavaScript computation. The embedder's per-command timeout remains the hard
+limit: it stops the worker and starts a fresh one for the next command,
+discarding unsaved changes and scratch files.
+
+These shell additions require sandbox 0.4.4. Engines fetch their pinned
+sandbox version; use `CHRYSALIS_SANDBOX_DIR` to try a local checkout.
 
 ## Built with
 
@@ -72,4 +93,4 @@ that is the license the combined work carries. Chrysalis Engine stays a
 separate program under its own license and drives this runtime through a
 worker boundary (`runtime/session.mjs`).
 
-The 0.4.3 release also provides [source and build materials](https://github.com/ProjectChrysalis/chrysalis-sandbox/releases/download/v0.4.3/sandbox-0.4.3-sources.zip): the release source tree, full pinned upstream GPL sources, configurations, patches and build scripts. The source archive has a separate `SOURCE_SHA256SUMS`; the runtime archive checksum is unchanged.
+The release also provides [source and build materials](https://github.com/ProjectChrysalis/chrysalis-sandbox/releases/download/v0.4.4/sandbox-0.4.4-sources.zip): the release source tree, pinned upstream sources, configurations, patches and build scripts. The source archive has a separate `SOURCE_SHA256SUMS`.

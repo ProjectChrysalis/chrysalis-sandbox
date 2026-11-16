@@ -12,7 +12,7 @@ const decoder = new TextDecoder();
 const JQ = "vendor/jq/jq.wasm";
 
 /** busybox applets in this build (busybox/busybox.config). */
-export const APPLETS = "ash awk base32 base64 basename bc cal cat cksum cmp comm cp crc32 cut date dc dd diff dirname dos2unix du echo egrep env expand expr factor false fgrep find fold getopt grep hd head hexdump install ls md5sum mkdir mktemp mv nl nproc od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum sha3sum sha512sum shuf sleep sort split stat strings stty sum tac tail tee test tr tree true truncate tsort uname unexpand uniq unix2dos unlink wc xargs xxd yes".split(" ");
+export const APPLETS = "ash awk base32 base64 basename bc cal cat cksum cmp comm cp crc32 cut date dc dd diff dirname dos2unix du echo egrep env expand expr factor false fgrep find fold getopt grep hd head hexdump install ls md5sum mkdir mv nl od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum sha3sum sha512sum shuf sleep sort split stat strings stty sum tac tail tee test tr tree true truncate tsort uname unexpand uniq unix2dos unlink wc xargs xxd yes".split(" ");
 
 export function preloadTools() {
   return preloadWasm(JQ);
@@ -1148,8 +1148,152 @@ export function makeTools({ store, net, shell }) {
     return store.statSync(path).mtimeMs;
   };
 
-  const timeout = (ctx) => ctx.fail("timeout: per-process limits are unavailable. Set the embedder's command timeout instead; the command was not run.", 125);
-  const nohup = (ctx) => ctx.fail("nohup: detached processes are unavailable; the command was not run.", 125);
+  const column = (ctx) => {
+    let table = false, across = false, separator, output = "  ", width = 80;
+    const files = [];
+    for (let i = 0; i < ctx.args.length; i++) {
+      const a = ctx.args[i];
+      if (a === "--") { files.push(...ctx.args.slice(i + 1)); break; }
+      if (a === "-t" || a === "--table") table = true;
+      else if (a === "-x" || a === "--fillrows") across = true;
+      else if (a === "-s" || a === "-o" || a === "-c") {
+        const value = ctx.args[++i];
+        if (value === undefined) return ctx.fail(`column: option requires an argument: ${a}`);
+        if (a === "-s") separator = value;
+        else if (a === "-o") output = value;
+        else {
+          width = Number(value);
+          if (!Number.isInteger(width) || width < 1 || width > 10000) return ctx.fail("column: width must be between 1 and 10000");
+        }
+      } else if (a !== "-" && a.startsWith("-")) return ctx.fail(`column: unsupported option: ${a}`);
+      else files.push(a);
+    }
+    const lines = [];
+    for (const file of files.length ? files : ["-"]) {
+      const text = decoder.decode(file === "-" ? ctx.readAll() : readFile(ctx, file));
+      for (const line of text.split(/\r?\n/)) if (line.trim() !== "") lines.push(line);
+    }
+    const length = (s) => Array.from(s).length;
+    const pad = (s, size) => s + " ".repeat(Math.max(0, size - length(s)));
+    if (table) {
+      const rows = lines.map((line) => separator ? line.split(new RegExp(`[${separator.replace(/[\\\]\-^]/g, "\\$&")}]`)) : line.trim().split(/\s+/));
+      const widths = [];
+      for (const row of rows) row.forEach((cell, i) => { widths[i] = Math.max(widths[i] ?? 0, length(cell)); });
+      for (const row of rows) ctx.print(row.map((cell, i) => i < row.length - 1 ? pad(cell, widths[i]) : cell).join(output) + "\n");
+    } else {
+      const cellWidth = lines.reduce((max, line) => Math.max(max, length(line) + 2), 1);
+      const columns = Math.max(1, Math.min(lines.length, Math.floor(width / cellWidth)));
+      const rows = Math.ceil(lines.length / columns);
+      for (let row = 0; row < rows; row++) {
+        const cells = [];
+        for (let col = 0; col < columns; col++) {
+          const cell = lines[across ? row * columns + col : col * rows + row];
+          if (cell !== undefined) cells.push(cell);
+        }
+        ctx.print(cells.map((cell, i) => i < cells.length - 1 ? pad(cell, cellWidth) : cell).join("") + "\n");
+      }
+    }
+    return 0;
+  };
+  const pager = (ctx) => {
+    const files = [];
+    for (let i = 0; i < ctx.args.length; i++) {
+      const a = ctx.args[i];
+      if (a === "--") { files.push(...ctx.args.slice(i + 1)); break; }
+      if (/^-[RrSFXNEegGMmqQiIs]+$/.test(a) || /^\+\d+$/.test(a)) continue;
+      if (a !== "-" && a.startsWith("-")) return ctx.fail(`${ctx.argv[0]}: unsupported option: ${a}`);
+      files.push(a);
+    }
+    // There is no terminal input to page through; emit the readable bytes.
+    return shell.spawn(["cat", "--", ...files], { cwd: ctx.cwd, env: ctx.env, stdin: ctx.stdin, stdinRedirected: ctx.stdinRedirected, stdout: ctx.stdout, stderr: ctx.stderr });
+  };
+  const editor = (ctx) => ctx.fail(`${ctx.argv[0]}: interactive editors are unavailable; use the file tools, sed, or a script`, 2);
+  const processSearch = (ctx) => ctx.fail(`${ctx.argv[0]}: no process table is available; jobs run sequentially and finish before the next command`, 2);
+
+  const mktemp = (ctx) => {
+    let directory = false, dry = false, quiet = false, root, suffix = "", template;
+    const value = (i) => {
+      if (i + 1 >= ctx.args.length) throw new Error(`mktemp: option requires an argument: ${ctx.args[i]}`);
+      return ctx.args[i + 1];
+    };
+    try {
+      let options = true;
+      for (let i = 0; i < ctx.args.length; i++) {
+        const a = ctx.args[i];
+        if (options && a === "--") { options = false; continue; }
+        if (options && a === "--directory") directory = true;
+        else if (options && a === "--dry-run") dry = true;
+        else if (options && a === "--quiet") quiet = true;
+        else if (options && a === "--tmpdir") root = ctx.env.TMPDIR || "/tmp";
+        else if (options && a.startsWith("--tmpdir=")) root = a.slice(9);
+        else if (options && a.startsWith("--suffix=")) suffix = a.slice(9);
+        else if (options && a === "--suffix") suffix = value(i++);
+        else if (options && a.startsWith("-") && a !== "-") {
+          for (let j = 1; j < a.length; j++) {
+            if (a[j] === "d") directory = true;
+            else if (a[j] === "u") dry = true;
+            else if (a[j] === "q") quiet = true;
+            else if (a[j] === "t") root = ctx.env.TMPDIR || "/tmp";
+            else if (a[j] === "p") { root = a.slice(j + 1) || value(i++); break; }
+            else throw new Error(`mktemp: invalid option: ${a[j]}`);
+          }
+        } else if (template === undefined) template = a;
+        else throw new Error("mktemp: too many templates");
+      }
+      if (template === undefined) { template = "tmp.XXXXXXXXXX"; root ??= ctx.env.TMPDIR || "/tmp"; }
+      const match = /X{3,}(?=[^X]*$)/.exec(template);
+      if (!match || suffix.includes("/")) throw new Error("mktemp: template needs at least three X characters and a suffix without slashes");
+      if (root !== undefined && template.startsWith("/")) throw new Error("mktemp: template must be relative with --tmpdir");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const random = new Uint8Array(match[0].length);
+        crypto.getRandomValues(random);
+        const name = template.slice(0, match.index) + Array.from(random, (b) => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 62]).join("") + template.slice(match.index + match[0].length) + suffix;
+        const shown = root === undefined ? name : `${root.replace(/\/$/, "")}/${name}`;
+        const path = ctx.resolve(shown);
+        if (exists(path)) continue;
+        if (!dry) {
+          if (directory) store.mkdirSync(path, { mode: 0o700 });
+          else store.createFileSync(path, { mode: 0o600 });
+        }
+        ctx.print(`${shown}\n`);
+        return 0;
+      }
+      throw new Error("mktemp: could not create a unique name");
+    } catch (error) {
+      return quiet ? 1 : ctx.fail(error.message);
+    }
+  };
+
+  const runChild = (ctx, argv, deadline) =>
+    shell.spawn(argv, { cwd: ctx.cwd, env: ctx.env, stdin: ctx.stdin, stdinRedirected: ctx.stdinRedirected, stdout: ctx.stdout, stderr: ctx.stderr, deadline });
+  const timeout = (ctx) => {
+    const argv = [...ctx.args];
+    let preserve = false;
+    while (argv[0]?.startsWith("-") && argv[0] !== "-") {
+      const a = argv.shift();
+      if (a === "--") break;
+      if (a === "--preserve-status") preserve = true;
+      else if (a === "--foreground" || a === "-v" || a === "--verbose") continue;
+      else if (a === "-s" || a === "-k" || a === "--signal" || a === "--kill-after") argv.shift();
+      else if (/^(-[sk].+|--signal=.*|--kill-after=.*)$/.test(a)) continue;
+      else return ctx.fail(`timeout: unrecognized option '${a}'`, 125);
+    }
+    const spec = argv.shift();
+    const m = /^(\d+(?:\.\d*)?|\.\d+)([smhd]?)$/.exec(spec ?? "");
+    if (!m) return ctx.fail(spec === undefined ? "timeout: missing operand" : `timeout: invalid time interval '${spec}'`, 125);
+    if (!argv.length) return ctx.fail("timeout: missing operand", 125);
+    const ms = Number(m[1]) * { "": 1000, s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2]];
+    const deadline = ms > 0 ? Date.now() + ms : undefined;
+    const code = runChild(ctx, argv, deadline);
+    if (deadline !== undefined && Date.now() >= deadline && (code === 124 || code === 130)) return preserve ? 137 : 124;
+    return code;
+  };
+  // Nothing outlives the command line here, so hangups cannot reach the
+  // command: it just runs, with output where nohup would put it.
+  const nohup = (ctx) => {
+    if (!ctx.args.length) return ctx.fail("nohup: missing operand", 125);
+    return runChild(ctx, ctx.args, undefined);
+  };
 
   return {
     which,
@@ -1169,6 +1313,17 @@ export function makeTools({ store, net, shell }) {
     chmod,
     ln,
     touch,
+    mktemp,
+    column,
+    less: pager,
+    more: pager,
+    vi: editor,
+    vim: editor,
+    nano: editor,
+    pgrep: processSearch,
+    pkill: processSearch,
+    // Commands share one synchronous worker, regardless of the host's cores.
+    nproc: (ctx) => ctx.args.some((a) => a !== "--all") ? ctx.fail("nproc: unsupported option") : (ctx.print("1\n"), 0),
     timeout,
     nohup,
     whoami: (ctx) => (ctx.print("sandbox\n"), 0),
@@ -1187,12 +1342,47 @@ export function makeTools({ store, net, shell }) {
 
 // ------------------------------------------------------------ helpers
 
-/** A `touch -d` date: `@seconds`, or anything Date understands. */
+/** A `touch -d` date: `@seconds`, a relative date ("2 days ago",
+ *  "yesterday", "+1 hour", "next week"), or anything Date understands. */
 function touchDate(value) {
   if (/^@-?\d+(\.\d+)?$/.test(value)) return Number(value.slice(1)) * 1000;
+  const relative = relativeDate(value);
+  if (relative !== null) return relative;
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) throw new Error(`touch: invalid date '${value}'`);
   return ms;
+}
+
+const RELATIVE_UNITS = { sec: "s", second: "s", min: "m", minute: "m", hour: "h", day: "d", week: "w", fortnight: "f", month: "M", year: "y" };
+function relativeDate(value) {
+  const d = new Date();
+  let matched = false;
+  const re = /\s*(?:(now|today|yesterday|tomorrow)|(?:(next|last)|([+-]?\d+))?\s*([a-z]+?)s?(?:\s+(ago))?)(?=\s|$)/giy;
+  let at = 0;
+  for (let m; at < value.length && (m = re.exec(value)); at = re.lastIndex) {
+    if (m[1]) {
+      const word = m[1].toLowerCase();
+      if (word === "yesterday") d.setDate(d.getDate() - 1);
+      if (word === "tomorrow") d.setDate(d.getDate() + 1);
+      matched = true;
+      continue;
+    }
+    const unit = RELATIVE_UNITS[m[4].toLowerCase()];
+    if (!unit) return null;
+    let n = m[2] ? (m[2].toLowerCase() === "next" ? 1 : -1) : m[3] ? Number(m[3]) : 1;
+    if (m[5]) n = -n;
+    if (unit === "s") d.setSeconds(d.getSeconds() + n);
+    else if (unit === "m") d.setMinutes(d.getMinutes() + n);
+    else if (unit === "h") d.setHours(d.getHours() + n);
+    else if (unit === "d") d.setDate(d.getDate() + n);
+    else if (unit === "w") d.setDate(d.getDate() + 7 * n);
+    else if (unit === "f") d.setDate(d.getDate() + 14 * n);
+    else if (unit === "M") d.setMonth(d.getMonth() + n);
+    else d.setFullYear(d.getFullYear() + n);
+    matched = true;
+  }
+  if (!matched || value.slice(at).trim()) return null;
+  return d.getTime();
 }
 
 /** A `touch -t` stamp, [[CC]YY]MMDDhhmm[.ss], in local time. */

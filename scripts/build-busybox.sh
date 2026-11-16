@@ -12,6 +12,9 @@
 #   busybox/cmdsubst.patch   $(...) run in-process leaves the enclosing word's
 #                            expansion state alone ("$@ $(cmd)" kept its fields)
 #   busybox/heredoc.patch    all heredoc sizes use the host's buffered pipes
+#   busybox/limits.patch     initialized resource limits, refuse unenforced quotas
+#   busybox/pipe.patch       bounded pipe writers exit with status 141
+#   busybox/bash.patch       shell syntax, arrays, builtins and fork-free jobs
 # Needs zig (0.15.x); set ZIG_DIR to a zig folder when it is not on PATH.
 set -e
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,20 +33,23 @@ git -C "$src" checkout -q -f "$WASI_SH_COMMIT"
 git -C "$src" checkout -q -- build src
 
 patch -s -p1 -d "$src" < "$repo/busybox/wasistubs.patch"
+patch -s -p1 -d "$src" < "$repo/busybox/pipe.patch"
+patch -s -p1 -d "$src" < "$repo/busybox/limits.patch"
 cp "$repo/busybox/busybox.config" "$src/build/busybox.config"
 cp "$repo/busybox/spawn.patch" "$src/build/chrysalis-spawn.patch"
 cp "$repo/busybox/grep.patch" "$src/build/chrysalis-grep.patch"
 cp "$repo/busybox/scripts.patch" "$src/build/chrysalis-scripts.patch"
 cp "$repo/busybox/cmdsubst.patch" "$src/build/chrysalis-cmdsubst.patch"
 cp "$repo/busybox/heredoc.patch" "$src/build/chrysalis-heredoc.patch"
+cp "$repo/busybox/bash.patch" "$src/build/chrysalis-bash.patch"
 # Apply ours after wasi-sh's own patches, and drop its smoke test: that one
 # runs the stock shim, which has no __host_spawn. bun test covers the binary.
 sed -i.orig \
-  -e 's|^patch -p1 -d "\$BB" < "\$here/applet-interrupt.patch"$|&\npatch -p1 -d "$BB" < "$here/chrysalis-spawn.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-grep.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-scripts.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-cmdsubst.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-heredoc.patch"|' \
+  -e 's|^patch -p1 -d "\$BB" < "\$here/applet-interrupt.patch"$|&\npatch -p1 -d "$BB" < "$here/chrysalis-spawn.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-grep.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-scripts.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-cmdsubst.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-heredoc.patch"\npatch -p1 -d "$BB" < "$here/chrysalis-bash.patch"|' \
   -e '/^# --- smoke test/,/^# dist\/ is not committed/{/^# dist\/ is not committed/!d;}' \
   -e 's|^  --wrap __wasilibc_fd_renumber \\$|  --wrap __wasilibc_fd_renumber --wrap stat --wrap lstat --wrap fstat --wrap fstatat \\|' \
   "$src/build/build.sh"
-grep -q chrysalis-heredoc.patch "$src/build/build.sh" && grep -q "wrap fstatat" "$src/build/build.sh" || { echo "build.sh changed shape; update this script" >&2; exit 1; }
+grep -q chrysalis-bash.patch "$src/build/build.sh" && grep -q "wrap fstatat" "$src/build/build.sh" || { echo "build.sh changed shape; update this script" >&2; exit 1; }
 
 sh "$src/build/build.sh" --toolchain zig
 cp "$src/dist/busybox.wasm" "$repo/vendor/wasi-sh/dist/busybox.wasm"

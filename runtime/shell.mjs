@@ -187,6 +187,20 @@ export class Shell {
 
   /** One busybox instance, run to completion. */
   instance(args, { env, input, stdout, stderr }) {
+    if (this.deadline !== undefined) {
+      const until = this.deadline;
+      const over = () => { if (Date.now() >= until) throw new WasiExit(124); };
+      const source = input;
+      input = {
+        ...source,
+        interruptCount: () => (over(), source.interruptCount?.() ?? 0),
+        wait: (ms) => {
+          source.wait(Math.min(Number(ms) || 0, Math.max(0, until - Date.now())));
+          over();
+        },
+      };
+      over();
+    }
     const shim = new WasiShim({ args, env, files: {}, fs: this.store, stdout, stderr, input, builtins: this.provider });
     const redirected = () => shim.fds.get(0)?.type !== "stdin" || input.redirected === true;
     shim.builtins = {
@@ -236,21 +250,26 @@ export class Shell {
   run(command, { cwd = "/workspace", env = this.env, stdin = EMPTY, stdout, stderr }) {
     // Same line as the command, so `line N` in an error is the command's own.
     const script = `cd -- ${quote(cwd)} || exit 1; ${command}`;
-    return this.instance(["busybox", "ash", "-c", script], { env: { ...env, PWD: cwd }, input: fixedInput(stdin), stdout, stderr });
+    return this.instance(["busybox", "ash", "-c", script, "bash"], { env: { ...env, PWD: cwd }, input: fixedInput(stdin), stdout, stderr });
   }
 
   /** A child command from inside a running shell or builtin. */
-  spawn(argv, { cwd, env, stdin, stdinRedirected = false, stdout, stderr }) {
-    const ctx = this.wrap({ argv, cwd, env, stdin: stdin ?? (() => EMPTY), stdinRedirected, stdout, stderr, fs: null, interrupted: () => false });
-    if (this.commands.has(argv[0]) || argv[0]?.includes("/")) return this.dispatch(ctx);
-    // An applet or a shell builtin: a fresh instance runs exactly this argv.
-    const script = `cd -- ${quote(cwd)} || exit 1; ${argv.map(quote).join(" ")}`;
-    return this.instance(["busybox", "ash", "-c", script], {
-      env: { ...env, PWD: cwd },
-      input: streamInput(stdin ?? (() => EMPTY), stdinRedirected),
-      stdout,
-      stderr,
-    });
+  spawn(argv, { cwd, env, stdin, stdinRedirected = false, stdout, stderr, deadline }) {
+    // A deadline (timeout) covers everything the child starts in turn.
+    const outer = this.deadline;
+    const until = Math.min(deadline ?? Infinity, outer ?? Infinity);
+    const late = () => Date.now() >= until;
+    this.deadline = until === Infinity ? undefined : until;
+    try {
+      const ctx = this.wrap({ argv, cwd, env, stdin: stdin ?? (() => EMPTY), stdinRedirected, stdout, stderr, fs: null, interrupted: late });
+      if (this.commands.has(argv[0]) || argv[0]?.includes("/")) return this.dispatch(ctx);
+      // An applet or a shell builtin: a fresh instance runs exactly this argv.
+      const script = `cd -- ${quote(cwd)} || exit 1; ${argv.map(quote).join(" ")}`;
+      const input = streamInput(stdin ?? (() => EMPTY), stdinRedirected);
+      return this.instance(["busybox", "ash", "-c", script, "bash"], { env: { ...env, PWD: cwd }, input, stdout, stderr });
+    } finally {
+      this.deadline = outer;
+    }
   }
 
   /** A child whose output comes back as bytes instead of reaching a stream:
@@ -280,16 +299,16 @@ export class Shell {
       stderr: collect(err),
     });
     const stderr = concat(err);
-    if (command === undefined && code === 127 && decoder.decode(stderr).includes(`${list[0]}: not found`)) {
+    if (command === undefined && code === 127 && decoder.decode(stderr).includes(`${list[0]}: command not found`)) {
       return { error: `${list[0]}: command not found` };
     }
     return { code, stdout: concat(out), stderr };
   }
 
-  /** bash/sh/dash: a nested ash in the caller's directory. bash-only syntax
-   *  that ash lacks (arrays, `[[ =~ ]]`) is out of reach either way. */
+  /** bash/sh/dash: a nested shell in the caller's directory. */
   bash(ctx) {
     const args = ctx.args.slice();
+    const name = ctx.argv[0].split("/").pop() || "bash";
     const sets = [];
     let command = null;
     let readStdin = false;
@@ -324,14 +343,14 @@ export class Shell {
     const prefix = [`cd -- ${quote(ctx.cwd)} || exit 1`, ...sets].join("; ");
     let argv;
     if (command !== null) {
-      argv = ["busybox", "ash", "-c", `${prefix}; ${command}`, ...args];
+      argv = ["busybox", "ash", "-c", `${prefix}; ${command}`, ...(args.length ? args : [name])];
     } else if (args.length && !readStdin) {
       const script = ctx.resolve(args[0]);
       if (!this.store.isFile(script)) return ctx.fail(`${ctx.argv[0]}: ${args[0]}: No such file or directory`, 127);
       argv = ["busybox", "ash", "-c", `${prefix}; . ${quote(script)}`, ...args];
     } else {
       const text = decoder.decode(ctx.readAll());
-      argv = ["busybox", "ash", "-c", `${prefix}; ${text}`, "bash", ...args];
+      argv = ["busybox", "ash", "-c", `${prefix}; ${text}`, name, ...args];
     }
     return this.instance(argv, {
       env: { ...ctx.env, PWD: ctx.cwd },
@@ -345,12 +364,12 @@ export class Shell {
   script(ctx) {
     const name = ctx.argv[0];
     const path = ctx.resolve(name);
-    if (this.store.isDir(path)) return ctx.fail(`sh: ${name}: Is a directory`, 126);
+    if (this.store.isDir(path)) return ctx.fail(`bash: ${name}: Is a directory`, 126);
     const bytes = this.store.readFile(path);
     if (!bytes) {
       // /usr/bin/python3, /bin/sh: the program itself, wherever it was looked for
       const base = name.split("/").pop();
-      if (!/^\/(usr\/)?(local\/)?s?bin\/[^/]+$/.test(name) || !base) return ctx.fail(`sh: ${name}: not found`, 127);
+      if (!/^\/(usr\/)?(local\/)?s?bin\/[^/]+$/.test(name) || !base) return ctx.fail(`bash: ${name}: No such file or directory`, 127);
       if (this.commands.has(base)) return this.dispatch(this.wrap({ ...ctx, argv: [base, ...ctx.args] }));
       return this.spawn([base, ...ctx.args], { cwd: ctx.cwd, env: ctx.env, stdin: ctx.stdin, stdout: ctx.stdout, stderr: ctx.stderr });
     }
@@ -366,7 +385,7 @@ export class Shell {
       }
       if (/^python(\d(\.\d+)?)?$/.test(program)) program = "python3";
       if (program === "nodejs") program = "node";
-      if (!this.commands.has(program)) return ctx.fail(`sh: ${name}: ${program || "interpreter"}: not found`, 127);
+      if (!this.commands.has(program)) return ctx.fail(`bash: ${name}: ${program || "interpreter"}: bad interpreter: No such file or directory`, 126);
       interpreter = [program, ...words];
     }
     const argv = [...interpreter, path, ...ctx.args];

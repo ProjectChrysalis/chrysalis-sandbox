@@ -173,25 +173,104 @@ describe("network", () => {
   });
 });
 
-test("unsupported process substitution cannot poison later shell instances", async () => {
-  for (let n = 0; n < 3; n++) {
-    const failed = await sb.run("diff <(echo a) <(echo b)");
-    expect(failed.code).toBe(2);
-    expect(failed.err).toContain("Replace <(...) or >(...) with temporary files");
-    const next = await sb.run("printf 'next\\n'; echo $(echo nested); printf 'a\\n' | cat");
-    expect(next).toMatchObject({ code: 0, out: "next\nnested\na\n", err: "" });
-  }
-  expect(await sb.run("printf a > /tmp/left; printf b > /tmp/right; diff /tmp/left /tmp/right")).toMatchObject({ code: 1 });
-});
+describe("bash", () => {
+  const run = async (command) => {
+    const r = await sb.run(command, { timeout: 20_000 });
+    return { code: r.code, out: r.out, err: r.err };
+  };
 
-test("timeout and detached execution fail explicitly without running or discarding arguments", async () => {
-  for (const command of ["timeout 5 sleep 10", "timeout 1 touch never-created", "nohup touch never-created"]) {
-    const failed = await sb.run(command, { timeout: 1_000 });
-    expect(failed.code).toBe(125);
-    expect(failed.err).toContain("command was not run");
-    expect(sb.read("never-created")).toBeNull();
-    expect(await sb.run("echo recovered; echo $(echo nested)")).toMatchObject({ code: 0, out: "recovered\nnested\n", err: "" });
-  }
+  test("process substitution and background jobs run without a fork", async () => {
+    expect(await run("diff <(echo a) <(echo b) >/dev/null; echo $?")).toMatchObject({ out: "1\n", err: "" });
+    expect(await run("while read l; do echo \"<$l>\"; done < <(printf 'x\\ny\\n')")).toMatchObject({ out: "<x>\n<y>\n" });
+    expect(await run("echo hi | tee >(tr a-z A-Z) >/dev/null; sleep 0.1 & wait; echo $?")).toMatchObject({ out: "HI\n0\n", err: "" });
+  });
+
+  test("arrays, associative arrays and their expansions", async () => {
+    expect((await run('a=(x "y z"); a+=(w); echo ${#a[@]} "${a[1]}" ${a[-1]} ${!a[@]}; printf "<%s>" "${a[@]}"; echo')).out).toBe("3 y z w 0 1 2\n<x><y z><w>\n");
+    expect((await run('declare -A m=([k]=v [two words]="x y"); m[n]=1; echo ${#m[@]} "${m[two words]}"; for k in "${!m[@]}"; do echo "$k"; done | sort')).out).toBe("3 x y\nk\nn\ntwo words\n");
+    expect((await run('a=(a.txt b.txt); echo "${a[@]%.txt}" "${a[@]/#/p-}" "${a[@]:1}"; e=(); echo "[${e[@]}]" ${#e[@]}')).out).toBe("a b p-a.txt p-b.txt b.txt\n[] 0\n");
+    expect((await run("printf 'l1\\nl2\\n' | { mapfile -t L; echo ${#L[@]} ${L[1]}; }; echo 'a b  c' | { read -a w; echo ${w[2]}; }")).out).toBe("2 l2\nc\n");
+  });
+
+  test("subshells preserve array elements and restore parent values", async () => {
+    expect((await run('declare -A m=([k]="a b"); (m[k]=changed; m[new]=child; echo ${#m[@]}); printf "<%s>\\n" "${!m[@]}" "${m[k]}"')).out).toBe("2\n<k>\n<a b>\n");
+    expect((await run('a=([3]=x); b=$(printf "%s" "${!a[@]}"); echo "$b" "${!a[@]}"; (a[3]=y); echo ${a[3]}')).out).toBe("3 3\nx\n");
+  });
+
+  test("[[ ]], (( )), C-style for, regex captures and pattern operators", async () => {
+    expect((await run('touch fa.txt; [[ foo == f* ]] && echo a; [[ foo == "f*" ]] || echo b; [[ "a b" == a\\ * ]] && echo c; [[ x2 =~ ^x([0-9])$ ]] && echo ${BASH_REMATCH[1]}; rm fa.txt')).out).toBe("a\nb\nc\n2\n");
+    expect((await run("for ((i=0; i<3; i++)); do printf $i; done; echo; n=5; ((n+=2)); echo $n $((n*2)); ((0)) || echo zero")).out).toBe("012\n7 14\nzero\n");
+    expect((await run("x=Hello; echo ${x^^} ${x,,} ${x/#H/J} ${x/%o/0} ${x:1:3} ${#x}; y=x; echo ${!y}")).out).toBe("HELLO hello Jello Hell0 ell 5\nHello\n");
+  });
+
+  test("brace expansion", async () => {
+    expect((await run("echo {a,b}{1,2} x{1..3}y {05..07} {a..c} {3..1} {1..9..4} {a,{b,c}}d \"{q,r}\" {}")).out).toBe("a1 a2 b1 b2 x1y x2y x3y 05 06 07 a b c 3 2 1 1 5 9 ad bd cd {q,r} {}\n");
+    expect((await run("mkdir -p br/{s,t}/{u,v} && ls -d br/*/* && rm -r br")).out).toBe("br/s/u\nbr/s/v\nbr/t/u\nbr/t/v\n");
+    const large = await run("printf '%s' {1..100001}");
+    expect(large.code).not.toBe(0);
+    expect(large.err).toContain("brace expansion exceeds 100000 words");
+  });
+
+  test("unavailable shell options report failure", async () => {
+    expect(await run("shopt -s globstar; echo $?; shopt -q globstar; echo $?; shopt -u globstar")).toMatchObject({ code: 0, out: "1\n1\n" });
+    expect((await run("shopt -s extglob")).err).toContain("unavailable in this shell");
+  });
+
+  test("globbing options affect matches and unmatched patterns", async () => {
+    expect(await run('mkdir -p globcheck; touch globcheck/.hidden globcheck/visible; shopt -s dotglob; printf "%s\\n" globcheck/*; rm -r globcheck; shopt -s nullglob; set -- *.no-match-here; echo $#')).toMatchObject({ out: "globcheck/.hidden\nglobcheck/visible\n0\n", err: "" });
+    const result = await run("shopt -s nullglob failglob; echo *.no-match-here");
+    expect(result.code).not.toBe(0);
+    expect(result.err).toContain("no match:");
+  });
+
+  test("builtins agents reach for", async () => {
+    expect((await run("declare -i n=5; n+=3; declare -l lo=ABC; echo $n $lo; declare -p lo; printf -v pv '%03d' 7; echo $pv; printf '%q\\n' \"a b'c\"")).out).toBe("8 abc\ndeclare -l lo=\"abc\"\n007\na\\ b\\'c\n");
+    expect((await run("f(){ local -a v=(p q); echo ${v[1]} ${FUNCNAME[0]}; }; f; shopt -s nullglob; for g in *.none; do echo bad; done; set -o pipefail; false | true; echo $? ${PIPESTATUS[@]}")).out).toBe("q f\n1 1 0\n");
+    expect(await run("echo $0 $BASH_VERSINFO; nonexistent-command")).toMatchObject({ out: "bash 5\n", err: "bash: line 1: nonexistent-command: command not found\n" });
+    expect((await run("command -v ls cat; t=$SECONDS; echo ${t//[0-9]/}; nproc; mktemp -d | grep -c ^/tmp/")).out).toBe("ls\ncat\n\n1\n1\n");
+  });
+
+  test("endless writers into a short reader stop with SIGPIPE status", async () => {
+    const r = await run('yes | head -2; echo "${PIPESTATUS[@]}"; while :; do echo y; done | head -1');
+    expect(r.out).toBe("y\ny\n141 0\ny\n");
+  });
+
+  test("timeout enforces its limit, nohup runs the command", async () => {
+    expect(await run("timeout 0.3 sleep 5; echo $?; timeout 0.3 sh -c 'while :; do :; done'; echo $?")).toMatchObject({ out: "124\n124\n" });
+    expect(await run("timeout 5 touch to.txt; nohup touch nh.txt; ls to.txt nh.txt; rm to.txt nh.txt")).toMatchObject({ code: 0, out: "nh.txt\nto.txt\n" });
+    expect(await run("timeout 0.1 sh -c 'sleep 1; touch late.txt'; echo $?; test ! -e late.txt && echo clean; timeout 1 sh -c 'timeout 5 sleep 3'; echo $?; echo recovered")).toMatchObject({ code: 0, out: "124\nclean\n124\nrecovered\n", err: "" });
+  });
+
+  test("time, fd 3, xargs -n1 and relative dates", async () => {
+    expect(await run("time true")).toMatchObject({ code: 0, out: "" });
+    expect((await run("time true")).err).toMatch(/^\nreal\t0m0\.\d{3}s\n$/);
+    expect((await run("exec 3>fd3.txt; echo via3 >&3; exec 3>&-; cat fd3.txt; rm fd3.txt")).out).toBe("via3\n");
+    expect((await run("printf 'a\\nb\\n' | xargs -n1 echo; printf 'c\\n' | xargs -P4 -I{} echo x{}")).out).toBe("a\nb\nxc\n");
+    const today = (await run("date +%s")).out.trim();
+    const dayAgo = (await run("date -d '1 day ago' +%s")).out.trim();
+    expect(Number(today) - Number(dayAgo)).toBeGreaterThanOrEqual(86399);
+    expect((await run("touch -d yesterday y.txt && [ y.txt -ot keep.txt ] && echo older; rm y.txt")).out).toBe("older\n");
+  });
+
+  test("temporary files and directories are unique and private", async () => {
+    expect(await run('a=$(mktemp); b=$(mktemp); test "$a" != "$b" && echo unique; stat -c %a "$a"; d=$(mktemp -d); stat -c %a "$d"; f=$(mktemp -p "$d" --suffix=.txt item.XXXXXX); test -f "$f" && echo file; rm "$a" "$b"; rm -r "$d"')).toMatchObject({ code: 0, out: "unique\n600\n700\nfile\n", err: "" });
+    expect(await run('p=$(mktemp -u local.XXXXXX); test ! -e "$p" && echo dry; mktemp -q bad; echo $?; mktemp -q -p /missing x.XXXX; echo $?')).toMatchObject({ code: 0, out: "dry\n1\n1\n", err: "" });
+  });
+
+  test("resource limits never return uninitialized values or pretend to enforce quotas", async () => {
+    expect(await run("ulimit -n")).toMatchObject({ code: 0, out: "unlimited\n", err: "" });
+    expect((await run("ulimit -n 512")).code).not.toBe(0);
+  });
+
+  test("tables, pagers and unavailable interactive commands", async () => {
+    expect(await run("printf 'name count\\na 2\\nlong 3\\n' | column -t")).toMatchObject({ code: 0, out: "name  count\na     2\nlong  3\n", err: "" });
+    expect(await run("printf 'é:1\\nabc:2\\n' | column -t -s : -o ' | '")).toMatchObject({ code: 0, out: "é   | 1\nabc | 2\n", err: "" });
+    expect(await run("printf 'a\\nb\\nc\\nd\\n' | column -c 6")).toMatchObject({ code: 0, out: "a  c\nb  d\n", err: "" });
+    expect(await run("printf 'read me\\n' | less -FRX; more a/one.txt")).toMatchObject({ code: 0, out: "read me\n1\n", err: "" });
+    expect((await run("nano keep.txt")).err).toContain("interactive editors are unavailable");
+    expect((await run("pgrep bash")).code).toBe(2);
+    expect((await run("pkill bash")).err).toContain("no process table");
+  });
 });
 
 describe("touch, devices and git plumbing", () => {

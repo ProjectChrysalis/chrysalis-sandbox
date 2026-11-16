@@ -90,7 +90,9 @@ const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
 
 const errnoName = (n) => Object.keys(E).find((k) => E[k] === n) || String(n);
-const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70 };
+const E = { SUCCESS:0, BADF:8, EXIST:20, INTR:27, INVAL:28, IO:29, ISDIR:31, NOENT:44, NOSPC:51, NOSYS:52, NOTDIR:54, NOTEMPTY:55, PERM:63, NOTCAPABLE:76, AGAIN:6, SPIPE:70, PIPE:64 };
+const PIPE_CAP = 64 << 20, PIPE_WRITES = 1 << 20, PIPE_TAIL = 4096;
+const pipeSeal = (pi) => { if(pi.tailLen){ pi.chunks.push(pi.tail.subarray(0,pi.tailLen)); } pi.tail=null; pi.tailLen=0; };
 const FT = { CHAR:2, DIR:3, REG:4 };
 
 // Stores speak LINUX errno; WASI numbers its own list alphabetically. The two
@@ -222,7 +224,10 @@ export class WasiShim {
         if(globalThis.crypto&&globalThis.crypto.getRandomValues){ for(let o=0;o<len;o+=65536) globalThis.crypto.getRandomValues(a.subarray(o,Math.min(o+65536,len))); }
         else { for(let i=0;i<len;i++)a[i]=(Math.random()*256)|0; }
         return 0; },
-      fd_close:(fd)=>{ const f=w.fds.get(fd); w.fds.delete(fd); if(f&&f.type==='pipe') w.gcPipe(f.pipe); return 0; },
+      // wasi-libc addresses every path through the root preopen at fd 3 and
+      // checks it with fd_fdstat_get first, so a script's `exec 3>&-` must
+      // not take the root with it: closing 3 puts the root back.
+      fd_close:(fd)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; if(fd===3) w.fds.set(3,{ type:'dir', path:'/', preopen:true }); else w.fds.delete(fd); if(f.type==='pipe') w.gcPipe(f.pipe); return 0; },
       fd_fdstat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f) return E.BADF; const ft=f.type==='dir'?FT.DIR:(f.type==='file'?FT.REG:FT.CHAR); w.dv().setUint8(out,ft); w.dv().setUint16(out+2,0,true); w.dv().setBigUint64(out+8,~0n,true); w.dv().setBigUint64(out+16,~0n,true); return 0; },
       fd_fdstat_set_flags:(fd,flags)=>{ const f=w.fds.get(fd); if(f) f.nonblock=(flags&4)!==0; return 0; },
       fd_prestat_get:(fd,out)=>{ const f=w.fds.get(fd); if(!f||!f.preopen) return E.BADF; w.dv().setUint8(out,0); w.dv().setUint32(out+4,strBytes(f.path).length,true); return 0; },
@@ -237,6 +242,11 @@ export class WasiShim {
       path_open:(fd,dflags,pathp,plen,oflags,rb,ri,fdflags,out)=>{
         // oflags: 1=CREAT 2=DIRECTORY 4=EXCL 8=TRUNC; fdflags: 1=APPEND
         const path=w.resolve(fd,w.str(pathp,plen));
+        // /dev/fd/N and /dev/std* open a copy of an fd this run already holds,
+        // which is how a process substitution's /dev/fd/63 reaches a reader.
+        const alias=fdAlias(path);
+        if(alias!==undefined){ const src=w.fds.get(alias); if(!src) return E.BADF;
+          const nfd=w.nextFd++; w.fds.set(nfd,{...src,preopen:false}); w.dv().setUint32(out,nfd,true); return 0; }
         let { st, errno }=w.statOf(path);
         if(!st){
           if(!(oflags&1)) return errno;
@@ -451,7 +461,7 @@ export class WasiShim {
     return {
       wasi_snapshot_preview1: p1,
       env: {
-        __host_pipe:(fdptr)=>{ const idx=w.pipes.length; w.pipes.push({chunks:[],off:0}); const r=w.nextFd++, wr=w.nextFd++; w.fds.set(r,{type:'pipe',pipe:idx}); w.fds.set(wr,{type:'pipe',pipe:idx}); w.dv().setUint32(fdptr,r,true); w.dv().setUint32(fdptr+4,wr,true); return 0; },
+        __host_pipe:(fdptr)=>{ const idx=w.pipes.length; w.pipes.push({chunks:[],off:0,size:0,writes:0,tail:null,tailLen:0}); const r=w.nextFd++, wr=w.nextFd++; w.fds.set(r,{type:'pipe',pipe:idx}); w.fds.set(wr,{type:'pipe',pipe:idx}); w.dv().setUint32(fdptr,r,true); w.dv().setUint32(fdptr+4,wr,true); return 0; },
         // F_DUPFD: lowest free fd >= minfd, sharing the source's backing.
         __host_dup:(fd,minfd)=>{ const src=w.fds.get(fd); if(!src) return -1; let n=Math.max(minfd,4); while(w.fds.has(n)) n++; if(n>=w.nextFd) w.nextFd=n+1; w.fds.set(n,{...src,preopen:false}); return n; },
         __host_dup2:(oldfd,newfd)=>{ const src=w.fds.get(oldfd); if(!src) return -1; const prev=w.fds.get(newfd); if(newfd>=w.nextFd) w.nextFd=newfd+1; w.fds.set(newfd,{...src,preopen:false}); if(prev&&prev.type==='pipe') w.gcPipe(prev.pipe); return newfd; },
@@ -576,6 +586,9 @@ export class WasiShim {
   // comfortable lie it will act on. Every FS import starts here, so /dev never
   // reaches a store and a store's exception never escapes into the guest.
   statOf(path){
+    const alias=fdAlias(path);
+    if(alias!==undefined){ const f=this.fds.get(alias); if(!f) return { st:null, errno:E.BADF };
+      return { st:(!f.gone&&f.path!==undefined&&this.statAt(f.path))||this.anonStat(f) }; }
     const dev=this.deviceStat(path);
     if(dev) return { st:dev };
     if(this.ownsPath(path)) return { st:null, errno:E.NOENT };   // shadowed by the overlay
@@ -639,7 +652,10 @@ export class WasiShim {
   // and nlink 0 is what a real one says.
   anonStat(f){
     const t=this.bootMs, gone=f&&f.gone;
-    return { ino:0, nlink:gone?0:1, size:gone?gone.data.length:0,
+    // Each pipe is its own object: two process substitutions must not look
+    // like one file to a reader that compares inodes (diff does).
+    const ino=f&&f.type==='pipe'?0x40000000+f.pipe:0;
+    return { ino, nlink:gone?0:1, size:gone?gone.data.length:0,
       mode:gone?(S_IFREG|0o644):(f&&f.type==='dir'?S_IFDIR|0o755:S_IFCHR|0o666), uid:0, gid:0,
       atimeMs:t, mtimeMs:t, ctimeMs:t, device:!gone };
   }
@@ -733,11 +749,12 @@ export class WasiShim {
     if(f.type==='pipe'){
       const pi=this.pipes[f.pipe];
       if(!pi) return { data:EMPTY, errno:0 };
-      let avail=-pi.off; for(const c of pi.chunks) avail+=c.length;
-      const outb=new Uint8Array(Math.max(0,Math.min(max,avail))); let got=0;
+      pipeSeal(pi);
+      const outb=new Uint8Array(Math.max(0,Math.min(max,pi.size))); let got=0;
       while(got<outb.length&&pi.chunks.length){ const c=pi.chunks[0]; const take=Math.min(outb.length-got,c.length-pi.off);
         outb.set(c.subarray(pi.off,pi.off+take),got); pi.off+=take; got+=take;
         if(pi.off===c.length){ pi.chunks.shift(); pi.off=0; } }
+      pi.size-=got;
       return { data:outb, errno:0 };
     }
     if(f.type==='file'){
@@ -782,7 +799,27 @@ export class WasiShim {
     // Reporting those bytes as written would make a failed request look like a
     // delivered one.
     else if(f.device) return f.device.write(b,this.pos(f))||0;
-    else if(f.type==='pipe'){ const pi=this.pipes[f.pipe]; if(pi&&b.length) pi.chunks.push(b.slice()); }
+    // Stages run one after another, so a writer that never ends (yes, a
+    // `while :` loop) would buffer forever. Past PIPE_CAP bytes or
+    // PIPE_WRITES writes the writer gets EPIPE, which the guest turns into
+    // exit status 141 as a real SIGPIPE would.
+    else if(f.type==='pipe'){
+      const pi=this.pipes[f.pipe];
+      if(pi&&b.length){
+        if(pi.size+b.length>PIPE_CAP||pi.writes>=PIPE_WRITES){
+          if(!pi.full){ pi.full=true; this.writeFd(2,new TextEncoder().encode(`sh: pipe full (${PIPE_CAP>>20} MiB or ${PIPE_WRITES>>20}M writes), writer stopped\n`)); }
+          return E.PIPE;
+        }
+        pi.writes++; pi.size+=b.length;
+        // Small writes share one buffer: a shell loop echoing a line at a
+        // time would otherwise cost an object per line.
+        if(b.length>=PIPE_TAIL){ pipeSeal(pi); pi.chunks.push(b.slice()); }
+        else {
+          if(!pi.tail||pi.tailLen+b.length>pi.tail.length){ pipeSeal(pi); pi.tail=new Uint8Array(PIPE_TAIL*16); }
+          pi.tail.set(b,pi.tailLen); pi.tailLen+=b.length;
+        }
+      }
+    }
     else if(f.type==='file'){
       const p=this.pos(f);
       // An unlinked file still has its bytes and its offset; nobody else can
@@ -1161,6 +1198,8 @@ function responseBytes(out){
 }
 function envObj(list){ const o={}; for(const kv of list){ const i=kv.indexOf('='); if(i>0) o[kv.slice(0,i)]=kv.slice(i+1); } return o; }
 function parentOf(p){ const s=p.lastIndexOf('/'); return s>0?p.slice(0,s):'/'; }
+const STD_ALIAS={ '/dev/stdin':0, '/dev/stdout':1, '/dev/stderr':2 };
+function fdAlias(p){ if(p in STD_ALIAS) return STD_ALIAS[p]; const m=/^\/dev\/fd\/(\d+)$/.exec(p); return m?Number(m[1]):undefined; }
 function ownsDevPath(p){ return p==='/dev'||p.startsWith('/dev/'); }
 function joinPath(dir,name){ return dir==='/'?`/${name}`:`${dir}/${name}`; }
 function msToNs(ms){ return BigInt(Math.round((ms||0)*1e6)); }
